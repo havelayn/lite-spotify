@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or tag to build and publish (leave empty for the selected branch)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -19,6 +24,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
@@ -30,11 +37,49 @@ jobs:
           path: target/release/lite-spotify.exe
           if-no-files-found: error
 
+  # Every version in Cargo.toml gets its own permanent GitHub Release with the .exe,
+  # so older versions can always be downloaded again. A version that already has a
+  # release is left alone; bump the version in Cargo.toml to publish a new one.
+  release:
+    name: Publish release
+    needs: windows
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.ref != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: lite-spotify-windows
+      - name: Create the release if this version has none yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # An older commit built by hand must not become the "latest" release.
+          LATEST: ${{ inputs.ref == '' }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="v$version"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+            exit 0
+          fi
+          mv lite-spotify.exe "lite-spotify-$tag.exe"
+          gh release create "$tag" "lite-spotify-$tag.exe" \
+            --target "$(git rev-parse HEAD)" \
+            --title "lite-spotify $version" \
+            --generate-notes \
+            --latest="$LATEST"
+
   checks:
     name: fmt, clippy, tests (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

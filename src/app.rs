@@ -1031,6 +1031,12 @@ impl App {
             if ui.button("Sign out").clicked() {
                 self.sign_out();
             }
+            ui.separator();
+            ui.label(
+                RichText::new(concat!("lite-spotify ", env!("CARGO_PKG_VERSION")))
+                    .small()
+                    .color(MUTED),
+            );
         });
     }
 
