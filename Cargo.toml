@@ -1,6 +1,6 @@
 [package]
 name = "lite-spotify"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Lightweight Spotify Premium player for Windows (egui + librespot)"
 license = "MIT"
@@ -43,6 +43,18 @@ rand = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# The window handle, for Windows' media controls.
+raw-window-handle = "0.6"
+
+# Windows' media popup and media keys. 0.62 is the version egui already uses.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Media",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
 
 [profile.release]
 opt-level = 3

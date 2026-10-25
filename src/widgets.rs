@@ -42,6 +42,7 @@ pub enum Icon {
     Search,
     Close,
     Heart,
+    HeartOutline,
     Note,
     Disc,
     Mic,
@@ -135,6 +136,15 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.circle_filled(pt(0.18, -0.1), 0.2 * s, color);
             fill(&[(-0.375, -0.04), (0.375, -0.04), (0.0, 0.38)]);
         }
+        Icon::HeartOutline => {
+            // Two arcs that meet in the middle, and two lines down to the tip.
+            arc(-0.18, -0.1, 0.2, 140.0, 334.0);
+            arc(0.18, -0.1, 0.2, 206.0, 400.0);
+            let side = 140.0f32.to_radians();
+            let (x, y) = (0.2 * side.cos(), -0.1 + 0.2 * side.sin());
+            p.line_segment([pt(-0.18 + x, y), pt(0.0, 0.36)], line);
+            p.line_segment([pt(0.18 - x, y), pt(0.0, 0.36)], line);
+        }
         Icon::Note => {
             p.circle_filled(pt(-0.12, 0.22), 0.14 * s, color);
             p.line_segment([pt(0.0, 0.24), pt(0.0, -0.36)], line);
@@ -211,6 +221,18 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool, active: bo
         ui.painter()
             .circle_filled(pos2(rect.center().x, rect.bottom() - 1.0), 1.8, color);
     }
+    response
+}
+
+/// A heart that is filled in the accent colour when `liked`, an outline otherwise.
+pub fn heart_button(ui: &mut Ui, size: f32, liked: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 10.0), Sense::click());
+    let (icon, color) = match (liked, response.hovered()) {
+        (true, _) => (Icon::Heart, theme::accent()),
+        (false, true) => (Icon::HeartOutline, TEXT),
+        (false, false) => (Icon::HeartOutline, SUBDUED),
+    };
+    paint_icon(ui.painter(), rect.shrink(5.0), icon, color);
     response
 }
 
@@ -413,10 +435,11 @@ pub fn nav_row(ui: &mut Ui, icon: Icon, text: &str, selected: bool, playing: boo
 pub const ROW_HEIGHT: f32 = 30.0;
 pub const HEADER_HEIGHT: f32 = 28.0;
 
-/// x offset and width of each column: number, title, artist, album, time.
+/// x offset and width of each column: number, title, artist, album, time
+/// (with the heart).
 fn columns(width: f32) -> [(f32, f32); 5] {
     let num = 44.0;
-    let dur = 60.0;
+    let dur = 84.0;
     let rest = (width - num - dur).max(150.0);
     let title = rest * 0.4;
     let artist = rest * 0.3;
@@ -430,9 +453,70 @@ fn columns(width: f32) -> [(f32, f32); 5] {
     ]
 }
 
+/// A column the song table can be sorted by.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SortColumn {
+    Title,
+    Artist,
+    Album,
+    Time,
+}
+
+/// How a list is sorted: by a column, A to Z if true. `None` keeps the list's own order.
+pub type Sort = Option<(SortColumn, bool)>;
+
+const SORT_COLUMNS: [Option<SortColumn>; 5] = [
+    None,
+    Some(SortColumn::Title),
+    Some(SortColumn::Artist),
+    Some(SortColumn::Album),
+    Some(SortColumn::Time),
+];
+
 /// The column titles. `labels` names the artist and album columns, which hold
 /// the show and release date for podcast episodes.
 pub fn table_header(ui: &Ui, rect: Rect, labels: [&str; 2]) {
+    paint_header(ui, rect, labels, None, None);
+}
+
+/// Column titles that sort the list when clicked: once for A to Z, again for
+/// Z to A, a third time (or a click on #) for the list's own order.
+/// Returns the new sorting when it changed.
+pub fn sortable_header(ui: &mut Ui, rect: Rect, labels: [&str; 2], sort: Sort) -> Option<Sort> {
+    let cols = columns(rect.width());
+    let mut hovered = None;
+    let mut new_sort = None;
+    for (i, column) in SORT_COLUMNS.iter().enumerate() {
+        let cell = Rect::from_min_size(
+            pos2(rect.left() + cols[i].0, rect.top()),
+            vec2(cols[i].1, rect.height()),
+        );
+        let response = ui
+            .interact(cell, ui.scope_id().with(("sort", i)), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.hovered() {
+            hovered = Some(i);
+        }
+        if response.clicked() {
+            new_sort = Some(match (column, sort) {
+                (None, _) => None,
+                (Some(c), Some((s, true))) if *c == s => Some((*c, false)),
+                (Some(c), Some((s, false))) if *c == s => None,
+                (Some(c), _) => Some((*c, true)),
+            });
+        }
+    }
+    paint_header(ui, rect, labels, Some(sort), hovered);
+    new_sort
+}
+
+fn paint_header(
+    ui: &Ui,
+    rect: Rect,
+    labels: [&str; 2],
+    sort: Option<Sort>,
+    hovered: Option<usize>,
+) {
     let cols = columns(rect.width());
     let p = ui.painter();
     let font = theme::bold(12.0);
@@ -440,6 +524,14 @@ pub fn table_header(ui: &Ui, rect: Rect, labels: [&str; 2]) {
     let names = ["#", "TITLE", labels[0], labels[1], "TIME"];
     for (i, name) in names.iter().enumerate() {
         let (x, w) = cols[i];
+        let sorted = sort.flatten().filter(|(c, _)| SORT_COLUMNS[i] == Some(*c));
+        let color = if sorted.is_some() {
+            theme::accent()
+        } else if hovered == Some(i) {
+            TEXT
+        } else {
+            MUTED
+        };
         let (pos, align) = if i == 0 || i == 4 {
             (
                 pos2(rect.left() + x + w / 2.0, y),
@@ -448,7 +540,21 @@ pub fn table_header(ui: &Ui, rect: Rect, labels: [&str; 2]) {
         } else {
             (pos2(rect.left() + x + 8.0, y), egui::Align2::LEFT_CENTER)
         };
-        p.text(pos, align, *name, font.clone(), MUTED);
+        let text = p.text(pos, align, *name, font.clone(), color);
+        // A small triangle: up for A to Z, down for Z to A.
+        if let Some((_, ascending)) = sorted {
+            let c = pos2(text.right() + 8.0, y);
+            let d = if ascending { -1.0 } else { 1.0 };
+            p.add(Shape::convex_polygon(
+                vec![
+                    c + vec2(-4.0, -2.0 * d),
+                    c + vec2(4.0, -2.0 * d),
+                    c + vec2(0.0, 3.0 * d),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
     }
     p.hline(
         rect.x_range(),
@@ -471,6 +577,8 @@ pub struct RowMenu {
 pub struct RowAction {
     pub play: bool,
     pub queue: bool,
+    /// Add to Liked Songs, or remove from it.
+    pub like: bool,
     /// Add the song to this playlist.
     pub add_to: Option<String>,
     /// Make a new playlist with the song.
@@ -478,16 +586,28 @@ pub struct RowAction {
     pub remove: bool,
 }
 
-/// One song row: double-click (or click the number) to play, right-click for a menu.
+/// How a song row looks.
+pub struct RowState {
+    pub is_current: bool,
+    pub is_playing: bool,
+    pub liked: bool,
+}
+
+/// One song row: double-click (or click the number) to play, right-click for a
+/// menu, click the heart to like it.
 pub fn table_row(
     ui: &mut Ui,
     rect: Rect,
     number: usize,
     t: &Track,
-    is_current: bool,
-    is_playing: bool,
+    state: RowState,
     menu: &RowMenu,
 ) -> RowAction {
+    let RowState {
+        is_current,
+        is_playing,
+        liked,
+    } = state;
     let response = ui.interact(rect, ui.scope_id().with(("row", number)), Sense::click());
     let hovered = response.hovered();
     let bg = if is_current {
@@ -542,8 +662,9 @@ pub fn table_row(
             ui.add(egui::Label::new(RichText::new(text.as_str()).color(color)).truncate());
         });
     }
+    let time_cell = cell(4);
     ui.painter().text(
-        cell(4).center(),
+        pos2(time_cell.right() - 26.0, time_cell.center().y),
         egui::Align2::CENTER_CENTER,
         format_time(t.duration_ms),
         theme::regular(13.0),
@@ -555,6 +676,30 @@ pub fn table_row(
         response.on_hover_text("Not available");
         return action;
     }
+    // The heart: always shown for liked songs, as an outline on hover otherwise.
+    let heart = Rect::from_center_size(
+        pos2(time_cell.left() + 14.0, time_cell.center().y),
+        Vec2::splat(22.0),
+    );
+    let heart_response = ui.interact(heart, ui.scope_id().with(("heart", number)), Sense::click());
+    if liked || hovered || heart_response.hovered() {
+        let (icon, color) = match (liked, heart_response.hovered()) {
+            (true, _) => (Icon::Heart, accent),
+            (false, true) => (Icon::HeartOutline, TEXT),
+            (false, false) => (Icon::HeartOutline, MUTED),
+        };
+        paint_icon(ui.painter(), heart.shrink(5.0), icon, color);
+    }
+    if heart_response
+        .on_hover_text(if liked {
+            "Remove from Liked Songs"
+        } else {
+            "Save to Liked Songs"
+        })
+        .clicked()
+    {
+        action.like = true;
+    }
     let on_number = response
         .interact_pointer_pos()
         .is_some_and(|p| p.x < rect.left() + cols[1].0);
@@ -565,6 +710,14 @@ pub fn table_row(
         }
         if ui.button("Add to queue").clicked() {
             action.queue = true;
+        }
+        let like = if liked {
+            "Remove from Liked Songs"
+        } else {
+            "Save to Liked Songs"
+        };
+        if ui.button(like).clicked() {
+            action.like = true;
         }
         if let Some(target) = playlist_menu(ui, &menu.playlists) {
             match target {

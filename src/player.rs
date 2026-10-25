@@ -58,7 +58,11 @@ pub enum PlayerMsg {
 }
 
 enum Cmd {
-    Load { uri: String, position_ms: u32 },
+    Load {
+        uri: String,
+        position_ms: u32,
+        play: bool,
+    },
     Preload(String),
     Play,
     Pause,
@@ -92,10 +96,20 @@ impl PlayerCtl {
         let _ = self.cmds.send(cmd);
     }
 
+    /// Loads a track and starts playing it at `position_ms`.
     pub fn load(&self, uri: &str, position_ms: u32) {
         self.send(Cmd::Load {
             uri: uri.to_string(),
             position_ms,
+            play: true,
+        });
+    }
+    /// Loads a track without playing it, ready to continue at `position_ms`.
+    pub fn load_paused(&self, uri: &str, position_ms: u32) {
+        self.send(Cmd::Load {
+            uri: uri.to_string(),
+            position_ms,
+            play: false,
         });
     }
     pub fn preload(&self, uri: &str) {
@@ -259,7 +273,11 @@ async fn run(
 
     while let Some(cmd) = cmds.recv().await {
         match cmd {
-            Cmd::Load { uri, position_ms } => {
+            Cmd::Load {
+                uri,
+                position_ms,
+                play,
+            } => {
                 // The connection can drop (network change, laptop sleep); log in again
                 // with the saved login before loading the next track.
                 let invalid = shared_session
@@ -282,7 +300,7 @@ async fn run(
                     }
                 }
                 match SpotifyUri::from_uri(&uri) {
-                    Ok(id) => player.load(id, true, position_ms),
+                    Ok(id) => player.load(id, play, position_ms),
                     Err(_) => notify(PlayerMsg::Unavailable { uri }),
                 }
             }

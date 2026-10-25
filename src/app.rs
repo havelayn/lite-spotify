@@ -3,6 +3,7 @@
 
 mod ui;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -14,11 +15,17 @@ use crate::api::{self, Playlist, SearchResults, Show, Track, TrackSource, WebApi
 use crate::auth;
 use crate::config::{self, Config, Repeat};
 use crate::fun::{Fun, FunAction};
+use crate::media::{self, MediaKey};
 use crate::player::{PlayerCtl, PlayerMsg};
+use crate::session::Session;
 use crate::theme;
+use crate::update::{self, Release};
+use crate::widgets;
 
 /// How long a message at the bottom of the window stays visible.
 const NOTICE_TIME: Duration = Duration::from_secs(6);
+/// The sleep timer turns the volume down over this long before it pauses.
+const SLEEP_FADE: Duration = Duration::from_secs(20);
 
 /// Messages from background tasks to the UI thread.
 enum Msg {
@@ -59,6 +66,20 @@ enum Msg {
         image: egui::ColorImage,
     },
     Player(PlayerMsg),
+    /// Whether a song is in Liked Songs.
+    Liked {
+        uri: String,
+        liked: bool,
+    },
+    /// Liking or unliking a song worked or failed.
+    LikeDone {
+        track: Track,
+        liked: bool,
+        result: Result<(), String>,
+    },
+    /// A newer version is out.
+    Update(Release),
+    MediaKey(MediaKey),
 }
 
 /// Sends messages to the UI and wakes it up.
@@ -107,6 +128,70 @@ struct ListView {
     tracks: Vec<Track>,
     loading: bool,
     error: Option<String>,
+    /// Only show songs whose title, artist or album contain this.
+    filter: String,
+    /// Sort by this column (see `widgets::SortColumn`), ascending if true.
+    sort: widgets::Sort,
+    /// Indices into `tracks` in the order shown, and what they were worked out for.
+    shown: Vec<usize>,
+    shown_for: Option<(usize, String, widgets::Sort)>,
+}
+
+impl ListView {
+    fn new(id: u64, source: TrackSource) -> Self {
+        Self {
+            id,
+            source: Some(source),
+            loading: true,
+            ..Default::default()
+        }
+    }
+
+    /// Works out which songs to show, in which order, when anything changed.
+    fn update_shown(&mut self) {
+        let key = (self.tracks.len(), self.filter.clone(), self.sort);
+        if self.shown_for.as_ref() == Some(&key) {
+            return;
+        }
+        let words: Vec<String> = self
+            .filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.shown = (0..self.tracks.len())
+            .filter(|&i| {
+                let t = &self.tracks[i];
+                let text = format!("{} {} {}", t.name, t.artists, t.album).to_lowercase();
+                words.iter().all(|w| text.contains(w.as_str()))
+            })
+            .collect();
+        if let Some((column, ascending)) = self.sort {
+            let tracks = &self.tracks;
+            let text = |i: usize| -> String {
+                match column {
+                    widgets::SortColumn::Title => tracks[i].name.to_lowercase(),
+                    widgets::SortColumn::Artist => tracks[i].artists.to_lowercase(),
+                    widgets::SortColumn::Album => tracks[i].album.to_lowercase(),
+                    widgets::SortColumn::Time => String::new(),
+                }
+            };
+            // Sorting is stable, so equal songs keep the list's own order.
+            if column == widgets::SortColumn::Time {
+                self.shown.sort_by_key(|&i| tracks[i].duration_ms);
+            } else {
+                self.shown.sort_by_cached_key(|&i| text(i));
+            }
+            if !ascending {
+                self.shown.reverse();
+            }
+        }
+        self.shown_for = Some(key);
+    }
+
+    /// The songs as shown (filtered and sorted).
+    fn shown_tracks(&self) -> Vec<Track> {
+        self.shown.iter().map(|&i| self.tracks[i].clone()).collect()
+    }
 }
 
 #[derive(Default)]
@@ -214,6 +299,28 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Focus the big search box on the Search tab on the next frame.
     focus_search: bool,
+
+    /// Which songs are in Liked Songs, as far as known.
+    liked: HashMap<String, bool>,
+    /// Windows' media popup and the keyboard's media keys.
+    media: Option<media::Controls>,
+    /// What the media popup was last told, to only update it when something changes.
+    media_shown: Option<(String, media::State)>,
+    media_position_at: Option<Instant>,
+    sleep: Option<Sleep>,
+    /// The music is being faded out by the sleep timer.
+    sleep_fading: bool,
+    /// The queue saved at the last exit, loaded once the player is ready.
+    saved_session: Option<Session>,
+    /// A newer version that can be downloaded, until the user hides the banner.
+    update: Option<Release>,
+}
+
+/// When the sleep timer pauses the music.
+#[derive(Clone, Copy, PartialEq)]
+enum Sleep {
+    At(Instant),
+    EndOfSong,
 }
 
 /// Small windows on top of the app.
@@ -227,7 +334,7 @@ enum Dialog {
         id: String,
         name: String,
     },
-    /// The login is from before playlists could be changed.
+    /// The login is from before playlists and Liked Songs could be changed.
     NeedsLogin,
 }
 
@@ -293,12 +400,36 @@ impl App {
             queue_id: 0,
             dialog: None,
             focus_search: false,
+            liked: HashMap::new(),
+            media: None,
+            media_shown: None,
+            media_position_at: None,
+            sleep: None,
+            sleep_fading: false,
+            saved_session: None,
+            update: None,
         };
 
         #[cfg(debug_assertions)]
         if let Ok(which) = std::env::var("LITE_SPOTIFY_DEMO") {
             app.fill_demo_data(&which);
             return app;
+        }
+
+        let outbox = app.outbox.clone();
+        app.media = media::Controls::new(cc, move |key| outbox.send(Msg::MediaKey(key)));
+        if app.config.resume_session {
+            app.saved_session = Session::load();
+        }
+        if app.config.check_updates {
+            let (http, outbox) = (app.http.clone(), app.outbox.clone());
+            app.rt.spawn(async move {
+                match update::check(&http).await {
+                    Ok(Some(release)) => outbox.send(Msg::Update(release)),
+                    Ok(None) => {}
+                    Err(e) => log::info!("Could not look for updates: {e:#}"),
+                }
+            });
         }
 
         if app.config.client_id.is_empty() {
@@ -420,7 +551,7 @@ impl App {
         let outbox = self.outbox.clone();
         self.rt.spawn(async move {
             if let Ok(me) = api.me().await {
-                let can_edit = api.can_edit_playlists().await;
+                let can_edit = api.can_edit().await;
                 outbox.send(Msg::Me(me, can_edit));
             }
         });
@@ -466,6 +597,8 @@ impl App {
         self.now = NowPlaying::default();
         self.cover = None;
         self.user_name.clear();
+        self.liked.clear();
+        self.set_sleep(None);
         if self.fun.is_some() {
             self.fun = Some(Box::new(Fun::new()));
         }
@@ -540,13 +673,17 @@ impl App {
     /// Shows a playlist, album or Liked Songs on the Library tab (or a podcast on the Podcasts tab).
     fn open_list(&mut self, source: TrackSource) {
         let id = self.new_id();
-        let view = ListView {
-            id,
-            source: Some(source.clone()),
-            tracks: Vec::new(),
-            loading: true,
-            error: None,
+        let mut view = ListView::new(id, source.clone());
+        // Reloading the same list keeps its filter and sorting.
+        let old = if matches!(source, TrackSource::Show { .. }) {
+            &self.podcast
+        } else {
+            &self.library
         };
+        if old.source.as_ref() == Some(&source) {
+            view.filter = old.filter.clone();
+            view.sort = old.sort;
+        }
         if matches!(source, TrackSource::Show { .. }) {
             self.podcast = view;
             self.tab = Tab::Podcasts;
@@ -949,7 +1086,218 @@ impl App {
             since: None,
         };
         self.request_cover();
+        self.check_liked();
+        self.save_session();
         true
+    }
+
+    // -------------------------------------------------------- saved session
+
+    fn save_session(&self) {
+        if self.now.track.is_none() {
+            return;
+        }
+        Session::save(
+            &self.queue,
+            self.queue_pos,
+            self.now.position_ms(),
+            self.playing_source.as_ref(),
+            self.user_queued,
+        );
+    }
+
+    /// Loads the song that was playing at the last exit, paused where it was.
+    fn restore_session(&mut self) {
+        let Some(session) = self.saved_session.take() else {
+            return;
+        };
+        let Some(player) = &self.player else { return };
+        if self.now.track.is_some() {
+            return; // the user already started something else
+        }
+        let track = session.queue[session.queue_pos].clone();
+        player.load_paused(&track.uri, session.position_ms);
+        self.queue = session.queue;
+        self.queue_pos = session.queue_pos;
+        self.user_queued = session.user_queued;
+        self.playing_source = session.source;
+        self.unshuffled = None;
+        self.queue_id += 1;
+        self.now = NowPlaying {
+            track: Some(track),
+            playing: false,
+            loading: true,
+            position_ms: session.position_ms,
+            since: None,
+        };
+        self.request_cover();
+        self.check_liked();
+    }
+
+    // ---------------------------------------------------------- Liked Songs
+
+    /// Asks Spotify whether the current song is in Liked Songs, unless that is known.
+    fn check_liked(&mut self) {
+        let (Some(api), Some(track)) = (self.api.clone(), self.now.track.as_ref()) else {
+            return;
+        };
+        if self.liked.contains_key(&track.uri) {
+            return;
+        }
+        let uri = track.uri.clone();
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            match api.liked(std::slice::from_ref(&uri)).await {
+                Ok(answer) => {
+                    if let Some(&liked) = answer.first() {
+                        outbox.send(Msg::Liked { uri, liked });
+                    }
+                }
+                Err(e) => log::info!("Could not check Liked Songs: {e:#}"),
+            }
+        });
+    }
+
+    fn is_liked(&self, uri: &str) -> bool {
+        self.liked.get(uri).copied().unwrap_or(false)
+    }
+
+    /// Adds a song to Liked Songs, or removes it if it is there.
+    fn toggle_like(&mut self, track: Track) {
+        let Some(api) = self.api.clone() else { return };
+        if !self.check_can_edit() {
+            return;
+        }
+        let like = !self.is_liked(&track.uri);
+        // Show the change straight away; it is undone if Spotify refuses.
+        self.liked.insert(track.uri.clone(), like);
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = api
+                .set_liked(std::slice::from_ref(&track.uri), like)
+                .await
+                .map_err(|e| playlist_error("change Liked Songs", &e));
+            outbox.send(Msg::LikeDone {
+                track,
+                liked: like,
+                result,
+            });
+        });
+    }
+
+    fn on_like_done(&mut self, track: Track, liked: bool, result: Result<(), String>) {
+        if let Err(e) = result {
+            self.liked.insert(track.uri, !liked);
+            self.notify(e);
+            return;
+        }
+        // Keep an open Liked Songs list up to date.
+        if self.library.source == Some(TrackSource::LikedSongs) {
+            self.library.tracks.retain(|t| t.uri != track.uri);
+            if liked && !track.is_episode {
+                self.library.tracks.insert(0, track.clone());
+            }
+            self.library.shown_for = None;
+        }
+        self.notify(if liked {
+            format!("Added \"{}\" to Liked Songs", track.name)
+        } else {
+            format!("Removed \"{}\" from Liked Songs", track.name)
+        });
+    }
+
+    // ---------------------------------------------------------- sleep timer
+
+    fn set_sleep(&mut self, sleep: Option<Sleep>) {
+        if self.sleep_fading {
+            // Put the volume back where it was.
+            self.sleep_fading = false;
+            if let Some(p) = &self.player {
+                p.set_volume(self.config.volume);
+            }
+        }
+        self.sleep = sleep;
+    }
+
+    /// Fades out and pauses when the sleep timer runs out.
+    fn tick_sleep(&mut self, ctx: &egui::Context) {
+        let Some(Sleep::At(deadline)) = self.sleep else {
+            return;
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            if self.now.playing
+                && let Some(p) = &self.player
+            {
+                p.pause();
+            }
+            self.set_sleep(None);
+            self.notify("Sleep timer: the music is paused. Good night!");
+        } else if left <= SLEEP_FADE && self.now.playing {
+            self.sleep_fading = true;
+            let fraction = left.as_secs_f32() / SLEEP_FADE.as_secs_f32();
+            if let Some(p) = &self.player {
+                p.set_volume(self.config.volume * fraction);
+            }
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1).min(left));
+        }
+    }
+
+    // ---------------------------------------------------------- media keys
+
+    fn on_media_key(&mut self, key: MediaKey) {
+        match key {
+            MediaKey::Play if !self.now.playing => self.toggle_play(),
+            MediaKey::Pause | MediaKey::Stop if self.now.playing => self.toggle_play(),
+            MediaKey::Next if self.now.track.is_some() => self.next(),
+            MediaKey::Previous if self.now.track.is_some() => self.previous(),
+            MediaKey::SeekTo(ms) if self.now.track.is_some() => self.seek(ms),
+            _ => {}
+        }
+    }
+
+    /// Tells Windows' media popup what is playing, when that changed.
+    fn update_media_popup(&mut self) {
+        let Some(media) = &mut self.media else { return };
+        let Some(track) = &self.now.track else {
+            if self.media_shown.take().is_some() {
+                media.set_song(None);
+                media.set_state(media::State::Stopped, 0);
+            }
+            return;
+        };
+        let state = if self.now.playing {
+            media::State::Playing
+        } else if self.now.position_ms() > 0 || self.now.loading {
+            media::State::Paused
+        } else {
+            media::State::Stopped
+        };
+        let song_changed = self
+            .media_shown
+            .as_ref()
+            .is_none_or(|(uri, _)| *uri != track.uri);
+        if song_changed {
+            media.set_song(Some(media::SongInfo {
+                title: &track.name,
+                artist: &track.artists,
+                album: &track.album,
+                cover_url: track.image_url.as_deref(),
+                duration_ms: track.duration_ms,
+            }));
+        }
+        let state_changed = self.media_shown.as_ref().is_none_or(|(_, s)| *s != state);
+        // The position is sent now and then; Windows does not move it along itself.
+        let position_old = self
+            .media_position_at
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(5));
+        if song_changed || state_changed || position_old {
+            media.set_state(state, self.now.position_ms());
+            self.media_position_at = Some(Instant::now());
+        }
+        self.media_shown = Some((track.uri.clone(), state));
     }
 
     /// Jumps to a song further down the queue (from the Up next list).
@@ -987,6 +1335,7 @@ impl App {
         self.now.loading = false;
         self.now.position_ms = 0;
         self.now.since = None;
+        self.save_session();
     }
 
     fn previous(&mut self) {
@@ -1011,12 +1360,24 @@ impl App {
 
     fn seek(&mut self, position_ms: u32) {
         if let Some(p) = &self.player {
+            let duration = self.now.track.as_ref().map_or(0, |t| t.duration_ms);
+            let position_ms = position_ms.min(duration.saturating_sub(500));
             p.seek(position_ms);
             self.now.position_ms = position_ms;
             if self.now.since.is_some() {
                 self.now.since = Some(Instant::now());
             }
+            self.media_position_at = None;
         }
+    }
+
+    /// Jumps `seconds` forwards (or backwards when negative) in the current song.
+    fn seek_by(&mut self, seconds: i32) {
+        if self.now.track.is_none() {
+            return;
+        }
+        let target = self.now.position_ms() as i64 + seconds as i64 * 1000;
+        self.seek(target.max(0) as u32);
     }
 
     fn set_volume(&mut self, volume: f32) {
@@ -1074,7 +1435,10 @@ impl App {
         match msg {
             PlayerMsg::Connecting => self.player_state = PlayerState::Connecting,
             PlayerMsg::NeedsBrowserLogin(url) => self.player_state = PlayerState::BrowserLogin(url),
-            PlayerMsg::Ready => self.player_state = PlayerState::Ready,
+            PlayerMsg::Ready => {
+                self.player_state = PlayerState::Ready;
+                self.restore_session();
+            }
             PlayerMsg::Failed(e) => {
                 self.player_state = PlayerState::Failed(e);
                 self.now.loading = false;
@@ -1092,6 +1456,7 @@ impl App {
                 self.now.loading = false;
                 self.now.position_ms = position_ms;
                 self.now.since = None;
+                self.save_session();
             }
             PlayerMsg::Stopped => {}
             PlayerMsg::PreloadNext => {
@@ -1103,7 +1468,11 @@ impl App {
                 }
             }
             PlayerMsg::EndOfTrack { uri } if is_current(&uri) => {
-                if self.config.repeat == Repeat::One {
+                if self.sleep == Some(Sleep::EndOfSong) {
+                    self.set_sleep(None);
+                    self.stop_at_end();
+                    self.notify("Sleep timer: the song has ended. Good night!");
+                } else if self.config.repeat == Repeat::One {
                     self.play_at(self.queue_pos, true);
                 } else {
                     self.next();
@@ -1196,6 +1565,16 @@ impl App {
                     }
                 }
                 Msg::TracksPage { id, tracks } => {
+                    let liked_songs = (id == self.library.id
+                        && self.library.source == Some(TrackSource::LikedSongs))
+                        || self.fun.as_ref().is_some_and(|f| {
+                            f.pool_id() == id && *f.pool_source() == TrackSource::LikedSongs
+                        });
+                    if liked_songs {
+                        for t in &tracks {
+                            self.liked.insert(t.uri.clone(), true);
+                        }
+                    }
                     if id == self.library.id {
                         self.library.tracks.extend(tracks);
                     } else if id == self.podcast.id {
@@ -1245,6 +1624,16 @@ impl App {
                     self.cover_requested = None;
                 }
                 Msg::Player(msg) => self.on_player_msg(msg),
+                Msg::Liked { uri, liked } => {
+                    self.liked.insert(uri, liked);
+                }
+                Msg::LikeDone {
+                    track,
+                    liked,
+                    result,
+                } => self.on_like_done(track, liked, result),
+                Msg::Update(release) => self.update = Some(release),
+                Msg::MediaKey(key) => self.on_media_key(key),
             }
         }
     }
@@ -1299,12 +1688,13 @@ impl App {
             name: "Playlist number 2 with a fairly long name".into(),
         };
         self.library = ListView {
-            id: 1,
-            source: Some(source.clone()),
             tracks: tracks.clone(),
             loading: false,
-            error: None,
+            ..ListView::new(1, source.clone())
         };
+        for t in tracks.iter().step_by(3) {
+            self.liked.insert(t.uri.clone(), true);
+        }
         self.playing_source = Some(source);
         self.queue = tracks.clone();
         self.queue_pos = 2;
@@ -1348,11 +1738,6 @@ impl App {
             "podcasts" => {
                 self.tab = Tab::Podcasts;
                 self.podcast = ListView {
-                    id: 6,
-                    source: Some(TrackSource::Show {
-                        id: "show1".into(),
-                        name: "Podcast number 1".into(),
-                    }),
                     tracks: (1..=20u32)
                         .map(|i| Track {
                             uri: format!("spotify:episode:demo{i}"),
@@ -1368,10 +1753,26 @@ impl App {
                         })
                         .collect(),
                     loading: false,
-                    error: None,
+                    ..ListView::new(
+                        6,
+                        TrackSource::Show {
+                            id: "show1".into(),
+                            name: "Podcast number 1".into(),
+                        },
+                    )
                 };
             }
             "settings" => self.tab = Tab::Settings,
+            "sorted" => {
+                self.library.filter = "song 1".into();
+                self.library.sort = Some((widgets::SortColumn::Title, false));
+                self.sleep = Some(Sleep::At(Instant::now() + Duration::from_secs(1500)));
+                self.update = Some(Release {
+                    version: "9.9.9".into(),
+                    page_url: String::new(),
+                    download_url: String::new(),
+                });
+            }
             "search-empty" => self.tab = Tab::Search,
             game if game.starts_with("fun") => {
                 self.tab = Tab::Fun;

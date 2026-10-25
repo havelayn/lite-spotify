@@ -6,7 +6,11 @@ Built in Rust with [egui](https://github.com/emilk/egui) for the window and
 
 What it can do:
 
-- **Library:** Liked Songs and your playlists, in a simple song table.
+- **Library:** Liked Songs and your playlists, in a simple song table. Type in
+  **Filter this list** to find a song, and click a column title (Title, Artist, Album,
+  Time) to sort by it. Play then follows the order you see.
+- **Heart button:** save the song that is playing to Liked Songs (or click the heart in
+  any song row).
 - **Search:** songs, albums, playlists and podcasts, with recent searches and quick ideas
   (Chill, Workout, Focus, …) for when you don't know what to look for.
 - **Your own playlists:** make new ones, add songs (right-click a song → Add to playlist,
@@ -25,6 +29,17 @@ What it can do:
   - **Time Machine:** songs from a year or decade.
   - **Rediscover:** songs you saved long ago.
   - **Surprise Mix:** random songs from all over your playlists.
+- **Media keys:** the play/pause, next and previous keys on your keyboard work, and
+  Windows shows the song (with its cover) in the media popup next to the volume.
+- **Continues where you left off:** when you start the app, the last song and the queue
+  come back, paused at the same spot.
+- **Sleep timer:** under the volume. The music fades out and pauses after 15–90 minutes,
+  or after the current song.
+- **Keyboard shortcuts:** Space play/pause, Ctrl+→/← next/previous, →/← skip 10 seconds,
+  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+1…5 tabs.
+  The full list is in Settings.
+- **Update check:** when a new version is out, a banner with a **Download** button
+  appears at the top.
 - **Settings:** accent colour, turn the Fun tab on or off, account and log file.
 
 Streaming only: nothing is downloaded or saved, and Premium is required for playback.
@@ -78,12 +93,17 @@ Next time you start the app you are signed in automatically.
 ## Good to know
 
 - **Where are my settings?** In `%APPDATA%\lite-spotify` (paste that into the Explorer
-  address bar). `config.json` holds your Client ID, login token and volume;
+  address bar). `config.json` holds your Client ID, login token and volume; `session.json` the song and
+  queue to continue with;
   the `player` folder holds the player's saved login. `lite-spotify.log` is the log file.
   Please attach it when you report a bug.
 - **Sign out / use a different Client ID:** open the **Settings** tab.
-- **"One more permission":** making playlists needs a permission that versions before 0.4.0
-  didn't ask for. The app asks you to sign in once more the first time you make a playlist.
+- **"One more permission":** making playlists and saving songs to Liked Songs need
+  permissions that older versions didn't ask for. The app asks you to sign in once more
+  the first time you use them.
+- **Updating:** click **Download** in the banner (or get the newest `.exe` from Releases),
+  close the old app and start the new file. Your settings and login stay. You can delete
+  the old `.exe`.
 - **Playlist changes refused:** Spotify limits what personal developer apps may change. If
   Spotify refuses, the app says so; you can still make the change in the Spotify app.
 - **Turn off the Fun tab:** Settings → Fun tab. The games use almost no memory, and none
