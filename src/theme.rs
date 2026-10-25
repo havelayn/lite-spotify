@@ -162,7 +162,7 @@ pub fn set_light(ctx: &egui::Context, light: bool) {
 /// for covers that are mostly grey.
 pub fn cover_color(rgba: &[u8]) -> Option<Color32> {
     let mut bins = [(0.0f32, [0.0f32; 3]); 24];
-    for px in rgba.chunks_exact(4).step_by(3) {
+    for px in rgba.as_chunks::<4>().0.iter().step_by(3) {
         let [r, g, b] = [px[0], px[1], px[2]].map(|c| c as f32 / 255.0);
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
