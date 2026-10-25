@@ -8,7 +8,7 @@ version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad442f58ee04714aaa0ba0a2768c1ea1935b29507bb22ddece8cbbc76db02932"
 dependencies = [
- "uuid",
+ "uuid 1.29.0",
 ]
 
 [[package]]
@@ -772,6 +772,21 @@ dependencies = [
  "option-ext",
  "redox_users",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "discord-rich-presence"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90c55d69cab17c19677ce3a5f8face993a9e6eaf847fecac3547f3a3ff4a2494"
+dependencies = [
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_repr",
+ "thiserror 2.0.21",
+ "uuid 0.8.2",
 ]
 
 [[package]]
@@ -2175,6 +2190,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "librespot-connect"
+version = "0.8.0"
+source = "git+https://github.com/librespot-org/librespot?rev=99b6088bf3ea028f90192676ac1a337fa4b2ed12#99b6088bf3ea028f90192676ac1a337fa4b2ed12"
+dependencies = [
+ "futures-util",
+ "librespot-core",
+ "librespot-playback",
+ "librespot-protocol",
+ "log",
+ "protobuf",
+ "rand 0.9.5",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "uuid 1.29.0",
+]
+
+[[package]]
 name = "librespot-core"
 version = "0.8.0"
 source = "git+https://github.com/librespot-org/librespot?rev=99b6088bf3ea028f90192676ac1a337fa4b2ed12#99b6088bf3ea028f90192676ac1a337fa4b2ed12"
@@ -2226,7 +2260,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "url",
- "uuid",
+ "uuid 1.29.0",
  "vergen",
  "vergen-gitcl",
 ]
@@ -2245,7 +2279,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "uuid",
+ "uuid 1.29.0",
 ]
 
 [[package]]
@@ -2314,16 +2348,18 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lite-spotify"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "directories",
+ "discord-rich-presence",
  "eframe",
  "env_logger",
  "futures-util",
  "image",
  "jiff",
+ "librespot-connect",
  "librespot-core",
  "librespot-metadata",
  "librespot-playback",
@@ -3778,7 +3814,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3938,6 +3974,17 @@ dependencies = [
  "itoa",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "serde_repr"
+version = "0.1.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d3b1629de253c70a0508c3899572da79ca359fdab27c7920ff00406df418906"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4783,6 +4830,15 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+dependencies = [
+ "getrandom 0.2.17",
+]
+
+[[package]]
+name = "uuid"
 version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
@@ -5533,15 +5589,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]

@@ -36,6 +36,12 @@ pub struct Config {
     pub check_updates: bool,
     /// Closing the window keeps the app running in the notification area (Windows).
     pub close_to_tray: bool,
+    /// Show up as a Spotify Connect device, so a phone can play music here.
+    pub spotify_connect: bool,
+    /// Show the song in your Discord status.
+    pub discord_enabled: bool,
+    /// The Application ID of the user's own Discord application.
+    pub discord_app_id: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -65,6 +71,9 @@ impl Default for Config {
             resume_session: true,
             check_updates: true,
             close_to_tray: false,
+            spotify_connect: false,
+            discord_enabled: false,
+            discord_app_id: String::new(),
         }
     }
 }

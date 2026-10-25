@@ -14,9 +14,10 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use crate::api::{self, Playlist, SearchResults, Show, Track, TrackSource, WebApi};
 use crate::auth;
 use crate::config::{self, Config, Repeat};
+use crate::discord::{Discord, Presence};
 use crate::fun::{Fun, FunAction};
 use crate::media::{self, MediaKey};
-use crate::player::{Lyrics, PlayerCtl, PlayerMsg};
+use crate::player::{Lyrics, PlayerCtl, PlayerMsg, RemoteMsg};
 use crate::session::Session;
 use crate::stats;
 use crate::theme;
@@ -84,6 +85,8 @@ enum Msg {
     /// A newer version is out.
     Update(Release),
     Tray(TrayCmd),
+    /// Details of the song the Spotify Connect device is playing.
+    RemoteTrack(Track),
     Lyrics {
         uri: String,
         result: Result<Lyrics, String>,
@@ -353,6 +356,18 @@ pub struct App {
     quitting: bool,
     /// The main colour of the current cover, for the "Album" accent.
     cover_color: Option<egui::Color32>,
+
+    /// Another device is playing music here through Spotify Connect; the
+    /// buttons control that.
+    remote: bool,
+    /// The Spotify Connect device is running (or why it is not).
+    remote_status: Option<Result<(), String>>,
+    /// The Connect song whose details are being looked up: uri, position, playing.
+    remote_pending: Option<(String, u32, bool)>,
+
+    /// The Discord status, while turned on.
+    discord: Option<Discord>,
+    discord_shown: Option<Presence>,
 }
 
 struct StatsView {
@@ -479,6 +494,11 @@ impl App {
             mini: None,
             quitting: false,
             cover_color: None,
+            remote: false,
+            remote_status: None,
+            remote_pending: None,
+            discord: None,
+            discord_shown: None,
         };
 
         #[cfg(debug_assertions)]
@@ -491,6 +511,7 @@ impl App {
         app.media = media::Controls::new(cc, move |key| outbox.send(Msg::MediaKey(key)));
         let outbox = app.outbox.clone();
         app.tray = Tray::new(move |cmd| outbox.send(Msg::Tray(cmd)));
+        app.set_discord(app.config.discord_enabled);
         if app.config.resume_session {
             app.saved_session = Session::load();
         }
@@ -639,16 +660,31 @@ impl App {
     fn start_player(&mut self) {
         let outbox = self.outbox.clone();
         self.player_state = PlayerState::Connecting;
+        self.remote = false;
+        self.remote_status = None;
         self.player = Some(PlayerCtl::start(
             self.rt.handle(),
             self.http.clone(),
             self.config.volume,
+            self.config.spotify_connect,
             move |msg| outbox.send(Msg::Player(msg)),
         ));
     }
 
+    /// Starts the player again, e.g. after turning Spotify Connect on or off.
+    fn restart_player(&mut self) {
+        if let Some(p) = &self.player {
+            p.stop_connect();
+            p.stop();
+        }
+        self.now.playing = false;
+        self.now.since = None;
+        self.start_player();
+    }
+
     fn sign_out(&mut self) {
         if let Some(p) = &self.player {
+            p.stop_connect();
             p.stop();
         }
         self.player = None;
@@ -841,6 +877,7 @@ impl App {
 
     /// Plays a few seconds of `track` for Guess the Song, without showing it.
     fn quiz_play(&mut self, track: &Track, start_ms: u32, length_ms: u32) {
+        self.leave_remote();
         let Some(player) = &self.player else { return };
         if !self.player_ready() {
             self.notify("The player is not connected yet. Please wait a moment.");
@@ -1194,6 +1231,7 @@ impl App {
     /// Plays the first playable track at or after (or before, if `forward` is
     /// false) `index` in the queue.
     fn play_at(&mut self, index: usize, forward: bool) -> bool {
+        self.leave_remote();
         let Some(player) = &self.player else {
             return false;
         };
@@ -1229,7 +1267,7 @@ impl App {
     // -------------------------------------------------------- saved session
 
     fn save_session(&self) {
-        if self.now.track.is_none() {
+        if self.now.track.is_none() || self.remote {
             return;
         }
         Session::save(
@@ -1521,6 +1559,148 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------ Spotify Connect
+
+    /// Another device started playing here: pause our own player and show
+    /// (and control) what the other device plays.
+    fn on_remote(&mut self, msg: RemoteMsg) {
+        let (uri, position_ms, playing) = match msg {
+            RemoteMsg::Ready => {
+                self.remote_status = Some(Ok(()));
+                return;
+            }
+            RemoteMsg::Failed(e) => {
+                self.remote_status = Some(Err(e));
+                self.remote = false;
+                return;
+            }
+            RemoteMsg::Volume(v) => {
+                if self.remote {
+                    self.config.volume = v;
+                }
+                return;
+            }
+            RemoteMsg::Stopped => {
+                if self.remote {
+                    self.now.playing = false;
+                    self.now.since = None;
+                }
+                return;
+            }
+            RemoteMsg::Playing { uri, position_ms } => (uri, position_ms, true),
+            RemoteMsg::Paused { uri, position_ms } => (uri, position_ms, false),
+        };
+        if !self.remote {
+            if !playing {
+                return; // a pause of an earlier Connect session
+            }
+            self.save_session();
+            self.end_quiz();
+            if let Some(p) = &self.player {
+                p.pause();
+            }
+            self.remote = true;
+            self.notify("Playing from another device through Spotify Connect.");
+        }
+        if self.now.track.as_ref().is_some_and(|t| t.uri == uri) {
+            self.now.playing = playing;
+            self.now.loading = false;
+            self.now.position_ms = position_ms;
+            self.now.since = playing.then(Instant::now);
+            return;
+        }
+        // A new song: look up its name and cover first.
+        let lookup = self.remote_pending.as_ref().is_none_or(|(u, ..)| *u != uri);
+        self.remote_pending = Some((uri.clone(), position_ms, playing));
+        if lookup && let Some(player) = self.player.clone() {
+            let outbox = self.outbox.clone();
+            self.rt.spawn(async move {
+                match player.track_info(&uri).await {
+                    Ok(track) => outbox.send(Msg::RemoteTrack(track)),
+                    Err(e) => log::warn!("Could not look up the Connect song: {e:#}"),
+                }
+            });
+        }
+    }
+
+    fn on_remote_track(&mut self, track: Track) {
+        let Some((uri, position_ms, playing)) = self.remote_pending.take() else {
+            return;
+        };
+        if uri != track.uri || !self.remote {
+            self.remote_pending = Some((uri, position_ms, playing));
+            return;
+        }
+        self.now = NowPlaying {
+            track: Some(track),
+            playing,
+            loading: false,
+            position_ms,
+            since: playing.then(Instant::now),
+        };
+        self.request_cover();
+        self.check_liked();
+    }
+
+    /// The user plays something here: pause the Connect device and go back to
+    /// our own player.
+    fn leave_remote(&mut self) {
+        if !self.remote {
+            return;
+        }
+        self.remote = false;
+        self.remote_pending = None;
+        if let Some(p) = &self.player {
+            p.remote_pause();
+            p.set_volume(self.config.volume);
+        }
+    }
+
+    // -------------------------------------------------------------- Discord
+
+    fn set_discord(&mut self, on: bool) {
+        let id = self.config.discord_app_id.trim().to_string();
+        if on && !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+            self.discord = Some(Discord::start(id));
+        } else {
+            // Dropping it ends its thread, which clears the status.
+            self.discord = None;
+        }
+        self.discord_shown = None;
+    }
+
+    /// Tells Discord about the song when it, or play/pause, changed, or after a seek.
+    fn update_discord(&mut self) {
+        let Some(discord) = &self.discord else { return };
+        let presence = match &self.now.track {
+            Some(t) if self.now.playing && self.quiz.is_none() => {
+                let now_ms = jiff::Timestamp::now().as_millisecond();
+                let start_ms = now_ms - self.now.position_ms() as i64;
+                Some(Presence {
+                    title: t.name.clone(),
+                    artist: t.artists.clone(),
+                    album: t.album.clone(),
+                    cover_url: t.image_url.clone(),
+                    start_ms,
+                    end_ms: start_ms + t.duration_ms as i64,
+                })
+            }
+            _ => None,
+        };
+        // Ignore the start time drifting by less than two seconds.
+        let same = match (&presence, &self.discord_shown) {
+            (Some(a), Some(b)) => {
+                a.title == b.title && a.artist == b.artist && (a.start_ms - b.start_ms).abs() < 2000
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            discord.set(presence.clone());
+            self.discord_shown = presence;
+        }
+    }
+
     // ---------------------------------------------------------- sleep timer
 
     fn set_sleep(&mut self, sleep: Option<Sleep>) {
@@ -1625,6 +1805,12 @@ impl App {
     }
 
     fn next(&mut self) {
+        if self.remote {
+            if let Some(p) = &self.player {
+                p.remote_next();
+            }
+            return;
+        }
         self.quiz = None;
         self.user_queued = self.user_queued.saturating_sub(1);
         if self.play_at(self.queue_pos + 1, true) {
@@ -1656,6 +1842,12 @@ impl App {
     }
 
     fn previous(&mut self) {
+        if self.remote {
+            if let Some(p) = &self.player {
+                p.remote_previous();
+            }
+            return;
+        }
         self.end_quiz();
         if self.now.position_ms() > 3000 || self.queue_pos == 0 {
             self.seek(0);
@@ -1665,6 +1857,12 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        if self.remote {
+            if let Some(p) = &self.player {
+                p.remote_play_pause();
+            }
+            return;
+        }
         self.end_quiz();
         let Some(player) = &self.player else { return };
         if self.now.track.is_none() {
@@ -1678,6 +1876,12 @@ impl App {
     }
 
     fn seek(&mut self, position_ms: u32) {
+        if self.remote {
+            if let Some(p) = &self.player {
+                p.remote_seek(position_ms);
+            }
+            return;
+        }
         self.end_quiz();
         if let Some(p) = &self.player {
             let duration = self.now.track.as_ref().map_or(0, |t| t.duration_ms);
@@ -1703,7 +1907,11 @@ impl App {
     fn set_volume(&mut self, volume: f32) {
         self.config.volume = volume;
         if let Some(p) = &self.player {
-            p.set_volume(volume);
+            if self.remote {
+                p.remote_volume(volume);
+            } else {
+                p.set_volume(volume);
+            }
         }
     }
 
@@ -1751,6 +1959,10 @@ impl App {
     }
 
     fn on_player_msg(&mut self, msg: PlayerMsg) {
+        let msg = match msg {
+            PlayerMsg::Remote(remote) => return self.on_remote(remote),
+            other => other,
+        };
         if let Some(quiz) = &mut self.quiz {
             match &msg {
                 PlayerMsg::Playing { uri, .. } if *uri == quiz.uri => {
@@ -1990,6 +2202,7 @@ impl App {
                 }
                 Msg::MediaKey(key) => self.on_media_key(key),
                 Msg::Tray(cmd) => self.on_tray(ctx, cmd),
+                Msg::RemoteTrack(track) => self.on_remote_track(track),
             }
         }
     }
