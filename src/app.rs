@@ -149,6 +149,8 @@ pub struct App {
     skipped_in_a_row: usize,
     cover: Option<(String, TextureHandle)>,
     cover_requested: Option<String>,
+    /// The browser sign-in that is waiting for the user, so it can be cancelled.
+    sign_in_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -199,6 +201,7 @@ impl App {
             skipped_in_a_row: 0,
             cover: None,
             cover_requested: None,
+            sign_in_task: None,
         };
 
         if app.config.client_id.is_empty() {
@@ -267,7 +270,7 @@ impl App {
             self.outbox.clone(),
         );
         let on_new = self.on_new_refresh_token();
-        self.rt.spawn(async move {
+        self.sign_in_task = Some(self.rt.spawn(async move {
             let url_outbox = outbox.clone();
             let result = auth::login(
                 &http,
@@ -285,7 +288,7 @@ impl App {
                 }
                 Err(e) => outbox.send(Msg::SignInFailed(format!("{e:#}"))),
             }
-        });
+        }));
     }
 
     fn on_signed_in(&mut self, api: Arc<WebApi>, refresh_token: Option<String>) {
@@ -429,6 +432,10 @@ impl App {
         let Some(player) = &self.player else {
             return false;
         };
+        if !matches!(self.player_state, PlayerState::Ready) {
+            self.notice = Some("The player is not connected yet. Please wait a moment.".into());
+            return false;
+        }
         let mut i = index;
         loop {
             match self.queue.get(i) {
@@ -721,6 +728,7 @@ impl App {
         let (url, busy, error) = (url.clone(), *busy, error.clone());
         let mut sign_in = false;
         let mut change_id = false;
+        let mut cancel = false;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
@@ -736,6 +744,10 @@ impl App {
                     if let Some(url) = &url {
                         ui.add_space(8.0);
                         ui.hyperlink_to("Browser did not open? Click here.", url);
+                        ui.add_space(12.0);
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
                     }
                 } else {
                     if let Some(e) = &error {
@@ -744,8 +756,12 @@ impl App {
                     }
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("  Sign in with Spotify  ").size(18.0))
-                                .fill(GREEN),
+                            egui::Button::new(
+                                RichText::new("  Sign in with Spotify  ")
+                                    .size(18.0)
+                                    .color(Color32::BLACK),
+                            )
+                            .fill(GREEN),
                         )
                         .clicked()
                     {
@@ -760,6 +776,17 @@ impl App {
         });
         if sign_in {
             self.start_browser_sign_in();
+        }
+        if cancel {
+            // Stops the local login server, which frees the port again.
+            if let Some(task) = self.sign_in_task.take() {
+                task.abort();
+            }
+            self.screen = Screen::SignIn {
+                url: None,
+                busy: false,
+                error: None,
+            };
         }
         if change_id {
             self.screen = Screen::Setup {
@@ -1101,6 +1128,8 @@ impl App {
                 header_row(ui);
                 let current = self.now.track.as_ref().map(|t| t.uri.as_str());
                 let mut play = None;
+                // Rows sit directly below each other; the hover highlight separates them.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 egui::ScrollArea::vertical().auto_shrink(false).show_rows(
                     ui,
                     ROW_HEIGHT,
@@ -1141,11 +1170,14 @@ impl App {
                 } else {
                     header_row(ui);
                 }
-                for (i, t) in results.tracks.iter().enumerate() {
-                    if track_row(ui, i + 1, t, current == Some(t.uri.as_str())) {
-                        play = Some(i);
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, t) in results.tracks.iter().enumerate() {
+                        if track_row(ui, i + 1, t, current == Some(t.uri.as_str())) {
+                            play = Some(i);
+                        }
                     }
-                }
+                });
                 ui.add_space(12.0);
                 ui.label(RichText::new("Albums").size(17.0).strong());
                 for a in &results.albums {
@@ -1183,7 +1215,11 @@ impl eframe::App for App {
             Screen::Setup { .. } => self.setup_screen(ui),
             Screen::SignIn { .. } => self.sign_in_screen(ui),
             Screen::Main => {
-                if ctx.input(|i| i.key_pressed(Key::Space)) && !ctx.egui_wants_keyboard_input() {
+                // Space toggles play/pause, unless the user is typing. The key is consumed
+                // so a focused button does not also react to it.
+                if !ctx.egui_wants_keyboard_input()
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space))
+                {
                     self.toggle_play();
                 }
                 self.top_bar(ui);
@@ -1294,11 +1330,14 @@ fn track_row(ui: &mut egui::Ui, number: usize, t: &Track, is_current: bool) -> b
         } else {
             color
         };
-        ui.put(
-            cell,
-            egui::Label::new(RichText::new(text).color(text_color))
-                .truncate()
-                .selectable(false),
+        let label = egui::Label::new(RichText::new(text).color(text_color))
+            .truncate()
+            .selectable(false);
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(cell)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| ui.add(label),
         );
     }
     if !t.playable {
