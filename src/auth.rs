@@ -27,7 +27,12 @@ pub const WEB_SCOPES: &[&str] = &[
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
+    "playlist-modify-private",
+    "playlist-modify-public",
 ];
+
+/// Needed to make and change playlists. Logins from versions before 0.4.0 lack them.
+pub const PLAYLIST_EDIT_SCOPES: &[&str] = &["playlist-modify-private", "playlist-modify-public"];
 
 /// Spotify only lets its own client ID log in to the audio servers, so the
 /// player logs in with the ID librespot uses, on the redirect URI registered for it.
@@ -42,6 +47,8 @@ pub struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Instant,
+    /// The permissions the user granted, separated by spaces.
+    pub scope: String,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +56,8 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: u64,
+    #[serde(default)]
+    scope: String,
 }
 
 impl From<TokenResponse> for Tokens {
@@ -58,6 +67,7 @@ impl From<TokenResponse> for Tokens {
             refresh_token: r.refresh_token,
             // Refresh a minute early so a request never goes out with a token about to expire.
             expires_at: Instant::now() + Duration::from_secs(r.expires_in.saturating_sub(60)),
+            scope: r.scope,
         }
     }
 }

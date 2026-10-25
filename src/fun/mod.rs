@@ -25,6 +25,8 @@ pub enum FunAction {
     LoadPool(TrackSource),
     /// Build a "Surprise Mix" from random songs of random playlists.
     MakeSurpriseMix,
+    /// Save these songs as a new playlist with this name.
+    SaveAsPlaylist(String, Vec<Track>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -405,7 +407,7 @@ impl Fun {
                 theme::accent(),
             );
             ui.vertical(|ui| {
-                ui.set_width((ui.available_width() - 330.0).max(120.0));
+                ui.set_width((ui.available_width() - 460.0).max(120.0));
                 ui.label(RichText::new(&pick.title).small().color(theme::accent()));
                 let first = &pick.tracks[0];
                 let text = if pick.tracks.len() == 1 {
@@ -425,6 +427,14 @@ impl Fun {
                     .clicked()
                 {
                     close = true;
+                }
+                if pick.tracks.len() > 1
+                    && widgets::button(ui, "Save as playlist", ButtonStyle::Ghost, 13.0).clicked()
+                {
+                    actions.push(FunAction::SaveAsPlaylist(
+                        pick.title.clone(),
+                        pick.tracks.clone(),
+                    ));
                 }
                 if widgets::button(ui, "Add to queue", ButtonStyle::Ghost, 13.0).clicked() {
                     actions.push(FunAction::Queue(pick.tracks.clone()));
