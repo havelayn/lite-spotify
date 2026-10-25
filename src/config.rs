@@ -15,6 +15,24 @@ pub struct Config {
     pub refresh_token: Option<String>,
     /// Volume from 0.0 to 1.0.
     pub volume: f32,
+    /// Name of the accent colour (see `theme::ACCENTS`).
+    pub accent: String,
+    /// Show the Fun tab (roulette, claw machine and the other song pickers).
+    pub fun_enabled: bool,
+    /// Play what a Fun tab game picks straight away, instead of asking first.
+    pub fun_autoplay: bool,
+    pub shuffle: bool,
+    pub repeat: Repeat,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub enum Repeat {
+    #[default]
+    Off,
+    /// Start the list again after the last song.
+    All,
+    /// Play the same song again and again.
+    One,
 }
 
 impl Default for Config {
@@ -23,6 +41,11 @@ impl Default for Config {
             client_id: String::new(),
             refresh_token: None,
             volume: 0.5,
+            accent: "Amber".into(),
+            fun_enabled: true,
+            fun_autoplay: false,
+            shuffle: false,
+            repeat: Repeat::Off,
         }
     }
 }

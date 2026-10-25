@@ -6,7 +6,29 @@ use eframe::egui::{
 };
 
 use crate::api::Track;
-use crate::theme::{self, GREEN, HOVER, MUTED, PLACEHOLDER, SELECTED, SUBDUED, TEXT};
+use crate::theme::{self, HOVER, MUTED, ON_ACCENT, RAISED, SUBDUED, TEXT};
+
+/// Runs `add_contents` in a child `Ui` placed by `builder` (usually a rect inside
+/// space that is already allocated), without moving the parent's layout cursor.
+pub fn place<R>(
+    ui: &mut Ui,
+    builder: egui::UiBuilder,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let mut child = ui.new_child(builder);
+    add_contents(&mut child)
+}
+
+/// Shorthand for [`place`] with a rect and a left-to-right, vertically centred layout.
+pub fn place_in<R>(ui: &mut Ui, rect: Rect, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    place(
+        ui,
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::left_to_right(Align::Center)),
+        add_contents,
+    )
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Icon {
@@ -21,8 +43,12 @@ pub enum Icon {
     Close,
     Heart,
     Note,
-    Clock,
     Disc,
+    Mic,
+    Shuffle,
+    Repeat,
+    RepeatOne,
+    Plus,
 }
 
 /// Draws `icon` to fill `rect`. Icons are drawn in a -0.5..0.5 square.
@@ -45,11 +71,11 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             color,
         );
     };
-    let arc = |radius: f32| {
-        let points: Vec<Pos2> = (0..=12)
+    let arc = |cx: f32, cy: f32, radius: f32, from_deg: f32, to_deg: f32| {
+        let points: Vec<Pos2> = (0..=16)
             .map(|i| {
-                let a = (-45.0 + 90.0 * i as f32 / 12.0f32).to_radians();
-                pt(0.02 + radius * a.cos(), radius * a.sin())
+                let a = (from_deg + (to_deg - from_deg) * i as f32 / 16.0).to_radians();
+                pt(cx + radius * a.cos(), cy + radius * a.sin())
             })
             .collect();
         p.add(Shape::line(points, line));
@@ -57,6 +83,15 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
     let speaker = || {
         bar(-0.42, -0.2, -0.13, 0.13);
         fill(&[(-0.22, -0.13), (0.0, -0.36), (0.0, 0.36), (-0.22, 0.13)]);
+    };
+    // Small arrow head pointing along (dx, dy) at (x, y).
+    let head = |x: f32, y: f32, dx: f32, dy: f32| {
+        let (nx, ny) = (-dy, dx);
+        fill(&[
+            (x + dx * 0.14, y + dy * 0.14),
+            (x + nx * 0.11, y + ny * 0.11),
+            (x - nx * 0.11, y - ny * 0.11),
+        ]);
     };
 
     match icon {
@@ -80,12 +115,12 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::VolumeLow => {
             speaker();
-            arc(0.18);
+            arc(0.02, 0.0, 0.18, -45.0, 45.0);
         }
         Icon::VolumeHigh => {
             speaker();
-            arc(0.18);
-            arc(0.36);
+            arc(0.02, 0.0, 0.18, -45.0, 45.0);
+            arc(0.02, 0.0, 0.36, -45.0, 45.0);
         }
         Icon::Search => {
             p.circle_stroke(pt(-0.06, -0.06), 0.26 * s, line);
@@ -105,69 +140,82 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.line_segment([pt(0.0, 0.24), pt(0.0, -0.36)], line);
             p.line_segment([pt(0.0, -0.36), pt(0.24, -0.2)], line);
         }
-        Icon::Clock => {
-            let thin = Stroke::new((s * 0.07).max(1.0), color);
-            p.circle_stroke(c, 0.38 * s, thin);
-            p.line_segment([c, pt(0.0, -0.22)], thin);
-            p.line_segment([c, pt(0.16, 0.08)], thin);
-        }
         Icon::Disc => {
             p.circle_stroke(c, 0.38 * s, line);
             p.circle_filled(c, 0.08 * s, color);
         }
+        Icon::Mic => {
+            p.rect_filled(
+                Rect::from_min_max(pt(-0.13, -0.42), pt(0.13, 0.08)),
+                CornerRadius::same((s * 0.13) as u8),
+                color,
+            );
+            arc(0.0, -0.04, 0.24, 0.0, 180.0);
+            p.line_segment([pt(0.0, 0.2), pt(0.0, 0.4)], line);
+            p.line_segment([pt(-0.16, 0.4), pt(0.16, 0.4)], line);
+        }
+        Icon::Shuffle => {
+            p.line_segment([pt(-0.4, -0.22), pt(-0.15, -0.22)], line);
+            p.line_segment([pt(-0.15, -0.22), pt(0.15, 0.22)], line);
+            p.line_segment([pt(0.15, 0.22), pt(0.3, 0.22)], line);
+            p.line_segment([pt(-0.4, 0.22), pt(-0.15, 0.22)], line);
+            p.line_segment([pt(-0.15, 0.22), pt(0.15, -0.22)], line);
+            p.line_segment([pt(0.15, -0.22), pt(0.3, -0.22)], line);
+            head(0.3, -0.22, 1.0, 0.0);
+            head(0.3, 0.22, 1.0, 0.0);
+        }
+        Icon::Repeat | Icon::RepeatOne => {
+            // A loop that is open at the top right, with an arrow head at its end.
+            arc(0.0, 0.0, 0.34, -50.0, 250.0);
+            let end = 250.0f32.to_radians();
+            let (ex, ey) = (0.34 * end.cos(), 0.34 * end.sin());
+            // The loop runs clockwise towards its end; the head points along it.
+            head(ex, ey, -end.sin(), end.cos());
+            if icon == Icon::RepeatOne {
+                p.text(
+                    c,
+                    egui::Align2::CENTER_CENTER,
+                    "1",
+                    theme::bold(s * 0.42),
+                    color,
+                );
+            }
+        }
+        Icon::Plus => {
+            p.line_segment([pt(-0.32, 0.0), pt(0.32, 0.0)], line);
+            p.line_segment([pt(0.0, -0.32), pt(0.0, 0.32)], line);
+        }
     }
 }
 
-/// Runs `add_contents` in a child `Ui` placed by `builder` (usually a rect inside
-/// space that is already allocated), without moving the parent's layout cursor.
-pub fn place<R>(
-    ui: &mut Ui,
-    builder: egui::UiBuilder,
-    add_contents: impl FnOnce(&mut Ui) -> R,
-) -> R {
-    let mut child = ui.new_child(builder);
-    add_contents(&mut child)
-}
-
-/// The app's logo: a green circle with a play symbol.
-pub fn paint_logo(p: &Painter, center: Pos2, radius: f32) {
-    p.circle_filled(center, radius, GREEN);
-    let icon = Rect::from_center_size(center + vec2(radius * 0.06, 0.0), Vec2::splat(radius * 0.9));
-    paint_icon(p, icon, Icon::Play, Color32::BLACK);
-}
-
-pub fn logo(ui: &mut Ui, radius: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(radius * 2.0), Sense::hover());
-    paint_logo(ui.painter(), rect.center(), radius);
-}
-
-/// A borderless icon that lights up on hover.
-pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Response {
+/// A borderless icon that lights up on hover. `active` draws it in the accent
+/// colour with a small dot underneath (for shuffle and repeat).
+pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool, active: bool) -> Response {
     let sense = if enabled {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 8.0), sense);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 10.0), sense);
     let color = if !enabled {
         MUTED
+    } else if active {
+        theme::accent()
     } else if response.hovered() {
         TEXT
     } else {
         SUBDUED
     };
-    paint_icon(ui.painter(), rect.shrink(4.0), icon, color);
+    paint_icon(ui.painter(), rect.shrink(5.0), icon, color);
+    if active {
+        ui.painter()
+            .circle_filled(pos2(rect.center().x, rect.bottom() - 1.0), 1.8, color);
+    }
     response
 }
 
 /// The round play/pause button.
-pub fn play_button(
-    ui: &mut Ui,
-    diameter: f32,
-    playing: bool,
-    fill: Color32,
-    enabled: bool,
-) -> Response {
+pub fn play_button(ui: &mut Ui, diameter: f32, playing: bool, enabled: bool) -> Response {
     let sense = if enabled {
         Sense::click()
     } else {
@@ -179,57 +227,68 @@ pub fn play_button(
     } else {
         1.0
     };
-    let fill = if enabled { fill } else { MUTED };
+    let fill = if enabled { theme::accent() } else { MUTED };
     ui.painter()
         .circle_filled(rect.center(), diameter / 2.0 * grow, fill);
     let icon = if playing { Icon::Pause } else { Icon::Play };
-    let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(diameter * 0.38 * grow));
-    paint_icon(ui.painter(), icon_rect, icon, Color32::BLACK);
+    let icon_rect = Rect::from_center_size(
+        rect.center() + vec2(if playing { 0.0 } else { diameter * 0.03 }, 0.0),
+        Vec2::splat(diameter * 0.38 * grow),
+    );
+    paint_icon(ui.painter(), icon_rect, icon, ON_ACCENT);
     response
 }
 
-pub enum PillStyle {
-    /// Green with black text, for the main action.
-    Primary,
-    /// Outlined, for secondary actions.
-    Outline,
+#[derive(Clone, Copy, PartialEq)]
+pub enum ButtonStyle {
+    /// Filled with the accent colour, for the main action.
+    Accent,
+    /// Outlined, for other actions.
+    Ghost,
 }
 
-/// A rounded "pill" button with bold text.
-pub fn pill_button(
+/// A rounded button with bold text.
+pub fn button(ui: &mut Ui, text: &str, style: ButtonStyle, font_size: f32) -> Response {
+    button_sized(ui, text, style, font_size, None)
+}
+
+/// Like [`button`], with a fixed width.
+pub fn button_sized(
     ui: &mut Ui,
     text: &str,
-    style: PillStyle,
+    style: ButtonStyle,
     font_size: f32,
-    full_width: bool,
+    width: Option<f32>,
 ) -> Response {
-    let font = theme::bold(font_size);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font, Color32::PLACEHOLDER);
-    let mut size = galley.size() + vec2(font_size * 3.0, font_size * 1.4);
-    if full_width {
-        size.x = ui.available_width();
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        theme::bold(font_size),
+        Color32::PLACEHOLDER,
+    );
+    let mut size = galley.size() + vec2(font_size * 2.0, font_size * 1.1);
+    if let Some(w) = width {
+        size.x = w;
     }
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hovered = response.hovered();
-    let radius = CornerRadius::same(255);
+    let radius = CornerRadius::same(6);
     let text_color = match style {
-        PillStyle::Primary => {
+        ButtonStyle::Accent => {
             let fill = if hovered {
-                Color32::from_rgb(0x3b, 0xe4, 0x77)
+                theme::accent().gamma_multiply(1.15)
             } else {
-                GREEN
+                theme::accent()
             };
             ui.painter().rect_filled(rect, radius, fill);
-            Color32::BLACK
+            ON_ACCENT
         }
-        PillStyle::Outline => {
-            let stroke = if hovered { TEXT } else { MUTED };
-            ui.painter().rect_stroke(
+        ButtonStyle::Ghost => {
+            let fill = if hovered { HOVER } else { RAISED };
+            ui.painter().rect(
                 rect,
                 radius,
-                Stroke::new(1.0, stroke),
+                fill,
+                Stroke::new(1.0, theme::BORDER),
                 egui::StrokeKind::Inside,
             );
             TEXT
@@ -240,8 +299,8 @@ pub fn pill_button(
     response
 }
 
-/// A thin Spotify-style bar slider. `value` is 0..1.
-/// Returns the response and the new value while the user is pressing it.
+/// A thin bar slider. `value` is 0..1. Returns the response and the new value
+/// while the user is pressing it.
 pub fn thin_slider(ui: &mut Ui, value: f32, width: f32, enabled: bool) -> (Response, Option<f32>) {
     let sense = if enabled {
         Sense::click_and_drag()
@@ -259,211 +318,174 @@ pub fn thin_slider(ui: &mut Ui, value: f32, width: f32, enabled: bool) -> (Respo
         new_value = Some(shown);
     }
     let active = enabled && (response.hovered() || response.dragged() || new_value.is_some());
-    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
-    let radius = CornerRadius::same(2);
-    ui.painter()
-        .rect_filled(track, radius, Color32::from_rgb(0x4d, 0x4d, 0x4d));
+    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 5.0));
+    let radius = CornerRadius::same(3);
+    ui.painter().rect_filled(track, radius, theme::BORDER);
     let mut filled = track;
     filled.set_right(track.left() + track.width() * shown);
-    let fill = match (enabled, active) {
-        (false, _) => MUTED,
-        (true, true) => GREEN,
-        (true, false) => TEXT,
-    };
+    let fill = if enabled { theme::accent() } else { MUTED };
     ui.painter().rect_filled(filled, radius, fill);
     if active {
         ui.painter()
-            .circle_filled(pos2(filled.right(), track.center().y), 6.0, TEXT);
+            .circle_filled(pos2(filled.right(), track.center().y), 7.0, TEXT);
     }
     (response, new_value)
 }
 
-/// A texture filled by `color_at(x, y)` with x and y in 0..1. Used for gradients.
-pub fn gradient_texture(
-    ctx: &egui::Context,
-    name: &str,
-    [w, h]: [usize; 2],
-    color_at: impl Fn(f32, f32) -> Color32,
-) -> TextureHandle {
-    let mut pixels = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
-            pixels.push(color_at(
-                x as f32 / (w - 1).max(1) as f32,
-                y as f32 / (h - 1).max(1) as f32,
-            ));
-        }
+/// The app's logo: an accent-coloured rounded square with equaliser bars.
+pub fn paint_logo(p: &Painter, rect: Rect) {
+    let s = rect.width();
+    p.rect_filled(rect, CornerRadius::same((s * 0.25) as u8), theme::accent());
+    let heights = [0.35, 0.6, 0.45, 0.7];
+    let bar_w = s * 0.11;
+    let gap = s * 0.06;
+    let total = heights.len() as f32 * bar_w + (heights.len() - 1) as f32 * gap;
+    let mut x = rect.center().x - total / 2.0;
+    let bottom = rect.bottom() - s * 0.2;
+    for h in heights {
+        p.rect_filled(
+            Rect::from_min_max(pos2(x, bottom - s * h * 0.75), pos2(x + bar_w, bottom)),
+            CornerRadius::same((bar_w / 2.0) as u8),
+            ON_ACCENT,
+        );
+        x += bar_w + gap;
     }
-    let image = egui::ColorImage::new([w, h], pixels);
-    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
 }
 
-pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+pub fn logo(ui: &mut Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    paint_logo(ui.painter(), rect);
 }
 
-/// Square artwork used where there is no cover image.
-pub enum Tile<'a> {
-    /// Purple-to-teal tile with a heart, like Spotify's Liked Songs.
-    Liked(&'a TextureHandle),
-    Playlist,
-    Album,
-    /// A loaded cover image.
-    Cover(&'a TextureHandle),
-}
-
-pub fn paint_tile(ui: &Ui, rect: Rect, tile: Tile, radius: u8) {
-    let corner = CornerRadius::same(radius);
-    match tile {
-        Tile::Liked(texture) | Tile::Cover(texture) => {
+/// Album art, or a placeholder with an icon when there is none.
+pub fn paint_cover(ui: &Ui, rect: Rect, texture: Option<&TextureHandle>, icon: Icon, radius: u8) {
+    match texture {
+        Some(texture) => {
             egui::Image::new((texture.id(), rect.size()))
-                .corner_radius(corner)
+                .corner_radius(CornerRadius::same(radius))
                 .paint_at(ui, rect);
-            if matches!(tile, Tile::Liked(_)) {
-                let icon = Rect::from_center_size(rect.center(), rect.size() * 0.4);
-                paint_icon(ui.painter(), icon, Icon::Heart, TEXT);
-            }
         }
-        Tile::Playlist | Tile::Album => {
-            ui.painter().rect_filled(rect, corner, PLACEHOLDER);
-            let icon = if matches!(tile, Tile::Album) {
-                Icon::Disc
-            } else {
-                Icon::Note
-            };
-            let icon_rect = Rect::from_center_size(rect.center(), rect.size() * 0.42);
-            paint_icon(ui.painter(), icon_rect, icon, theme::SUBDUED);
+        None => {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(radius), RAISED);
+            let icon_rect = Rect::from_center_size(rect.center(), rect.size() * 0.36);
+            paint_icon(ui.painter(), icon_rect, icon, MUTED);
         }
     }
 }
 
-/// One entry in the library list on the left (Liked Songs or a playlist).
-pub fn library_row(
-    ui: &mut Ui,
-    tile: Tile,
-    title: &str,
-    subtitle: &str,
-    selected: bool,
-    playing: bool,
-) -> Response {
-    let height = 56.0;
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    let bg = if selected {
-        Some(SELECTED)
+/// One line in a list on the left (Liked Songs, a playlist, a podcast).
+pub fn nav_row(ui: &mut Ui, icon: Icon, text: &str, selected: bool, playing: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), theme::SELECTED);
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.left_top() + vec2(0.0, 7.0), vec2(3.0, 18.0)),
+            CornerRadius::same(2),
+            theme::accent(),
+        );
     } else if response.hovered() {
-        Some(HOVER)
-    } else {
-        None
-    };
-    if let Some(bg) = bg {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), bg);
+        ui.painter().rect_filled(rect, CornerRadius::same(6), HOVER);
     }
-    let tile_rect = Rect::from_min_size(rect.min + vec2(8.0, 6.0), Vec2::splat(44.0));
-    paint_tile(ui, tile_rect, tile, 4);
-
+    let color = if playing {
+        theme::accent()
+    } else if selected {
+        TEXT
+    } else {
+        SUBDUED
+    };
+    let icon_rect =
+        Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), Vec2::splat(15.0));
+    paint_icon(ui.painter(), icon_rect, icon, color);
     let text_rect = Rect::from_min_max(
-        pos2(tile_rect.right() + 12.0, rect.top() + 9.0),
-        pos2(rect.right() - 8.0, rect.bottom() - 9.0),
+        pos2(rect.left() + 36.0, rect.top()),
+        pos2(rect.right() - 6.0, rect.bottom()),
     );
-    let title_color = if playing { GREEN } else { TEXT };
-    two_line_text(ui, text_rect, title, title_color, subtitle);
+    place_in(ui, text_rect, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).color(color)).truncate());
+    });
     response
-}
-
-/// A title with a smaller grey line under it, both cut off with "…" if too long.
-pub fn two_line_text(ui: &mut Ui, rect: Rect, title: &str, title_color: Color32, subtitle: &str) {
-    place(
-        ui,
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .layout(Layout::top_down(Align::Min)),
-        |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.add(
-                egui::Label::new(
-                    RichText::new(title)
-                        .font(theme::regular(15.0))
-                        .color(title_color),
-                )
-                .truncate(),
-            );
-            ui.add(
-                egui::Label::new(
-                    RichText::new(subtitle)
-                        .font(theme::regular(13.0))
-                        .color(SUBDUED),
-                )
-                .truncate(),
-            );
-        },
-    );
 }
 
 // ---- Song table ----
 
-pub const TRACK_ROW_HEIGHT: f32 = 52.0;
-pub const TRACK_HEADER_HEIGHT: f32 = 36.0;
+pub const ROW_HEIGHT: f32 = 30.0;
+pub const HEADER_HEIGHT: f32 = 28.0;
 
-/// x offset and width of each column: number, title, album, duration.
-fn columns(width: f32) -> [(f32, f32); 4] {
+/// x offset and width of each column: number, title, artist, album, time.
+fn columns(width: f32) -> [(f32, f32); 5] {
     let num = 44.0;
-    let dur = 64.0;
-    let rest = (width - num - dur).max(120.0);
-    let title = rest * 0.58;
-    let album = rest - title;
+    let dur = 60.0;
+    let rest = (width - num - dur).max(150.0);
+    let title = rest * 0.4;
+    let artist = rest * 0.3;
+    let album = rest - title - artist;
     [
         (0.0, num),
         (num, title),
-        (num + title, album),
-        (num + title + album, dur),
+        (num + title, artist),
+        (num + title + artist, album),
+        (num + title + artist + album, dur),
     ]
 }
 
-pub fn track_header(ui: &mut Ui, rect: Rect) {
+/// The column titles. `labels` names the artist and album columns, which hold
+/// the show and release date for podcast episodes.
+pub fn table_header(ui: &Ui, rect: Rect, labels: [&str; 2]) {
     let cols = columns(rect.width());
     let p = ui.painter();
-    let font = theme::regular(13.0);
+    let font = theme::bold(12.0);
     let y = rect.center().y;
-    p.text(
-        pos2(rect.left() + cols[0].0 + cols[0].1 / 2.0, y),
-        egui::Align2::CENTER_CENTER,
-        "#",
-        font.clone(),
-        SUBDUED,
-    );
-    for (i, text) in [(1, "Title"), (2, "Album")] {
-        p.text(
-            pos2(rect.left() + cols[i].0 + 8.0, y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            font.clone(),
-            SUBDUED,
-        );
+    let names = ["#", "TITLE", labels[0], labels[1], "TIME"];
+    for (i, name) in names.iter().enumerate() {
+        let (x, w) = cols[i];
+        let (pos, align) = if i == 0 || i == 4 {
+            (
+                pos2(rect.left() + x + w / 2.0, y),
+                egui::Align2::CENTER_CENTER,
+            )
+        } else {
+            (pos2(rect.left() + x + 8.0, y), egui::Align2::LEFT_CENTER)
+        };
+        p.text(pos, align, *name, font.clone(), MUTED);
     }
-    let clock = Rect::from_center_size(
-        pos2(rect.left() + cols[3].0 + cols[3].1 / 2.0, y),
-        Vec2::splat(15.0),
+    p.hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, theme::BORDER),
     );
-    paint_icon(p, clock, Icon::Clock, SUBDUED);
-    p.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, HOVER));
 }
 
-/// One song row in a table. Returns true when the user wants to play it
-/// (double-click on the row, or a click on the number).
-pub fn track_row(
+/// What the user did with a row.
+#[derive(Default)]
+pub struct RowAction {
+    pub play: bool,
+    pub queue: bool,
+}
+
+/// One song row: double-click (or click the number) to play, right-click for a menu.
+pub fn table_row(
     ui: &mut Ui,
     rect: Rect,
     number: usize,
     t: &Track,
     is_current: bool,
     is_playing: bool,
-) -> bool {
-    let response = ui.interact(rect, ui.scope_id().with(("track", number)), Sense::click());
+) -> RowAction {
+    let response = ui.interact(rect, ui.scope_id().with(("row", number)), Sense::click());
     let hovered = response.hovered();
-    if hovered {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), HOVER);
+    let bg = if is_current {
+        Some(theme::accent_soft())
+    } else if hovered {
+        Some(HOVER)
+    } else if number.is_multiple_of(2) {
+        Some(theme::SURFACE)
+    } else {
+        None
+    };
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
     }
     let cols = columns(rect.width());
     let cell = |i: usize| {
@@ -473,63 +495,71 @@ pub fn track_row(
         )
     };
 
-    // Number, or a play icon on hover, or a note for the song that is playing.
+    let accent = theme::accent();
     let num_rect = cell(0);
-    let icon_rect = Rect::from_center_size(num_rect.center(), Vec2::splat(14.0));
+    let icon_rect = Rect::from_center_size(num_rect.center(), Vec2::splat(12.0));
     if hovered && t.playable {
         paint_icon(ui.painter(), icon_rect, Icon::Play, TEXT);
     } else if is_current && is_playing {
-        paint_icon(ui.painter(), icon_rect, Icon::Note, GREEN);
+        paint_icon(ui.painter(), icon_rect, Icon::Note, accent);
     } else {
-        let color = if is_current { GREEN } else { SUBDUED };
         ui.painter().text(
             num_rect.center(),
             egui::Align2::CENTER_CENTER,
             number.to_string(),
-            theme::regular(14.0),
-            color,
+            theme::regular(13.0),
+            if is_current { accent } else { MUTED },
         );
     }
 
-    let dim = !t.playable;
-    let title_color = match (dim, is_current) {
-        (true, _) => MUTED,
-        (false, true) => GREEN,
-        (false, false) => TEXT,
+    let (title_color, other_color) = match (t.playable, is_current) {
+        (false, _) => (MUTED, MUTED),
+        (true, true) => (accent, SUBDUED),
+        (true, false) => (TEXT, SUBDUED),
     };
-    let title_rect = cell(1).shrink2(vec2(8.0, 8.0));
-    two_line_text(ui, title_rect, &t.name, title_color, &t.artists);
-
-    let other = if dim { MUTED } else { SUBDUED };
-    let album_rect = cell(2).shrink2(vec2(8.0, 0.0));
-    place(
-        ui,
-        egui::UiBuilder::new()
-            .max_rect(album_rect)
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            ui.add(egui::Label::new(RichText::new(&t.album).color(other)).truncate());
-        },
-    );
+    let texts = [
+        (1, &t.name, title_color),
+        (2, &t.artists, other_color),
+        (3, &t.album, other_color),
+    ];
+    for (i, text, color) in texts {
+        place_in(ui, cell(i).shrink2(vec2(8.0, 0.0)), |ui| {
+            ui.add(egui::Label::new(RichText::new(text.as_str()).color(color)).truncate());
+        });
+    }
     ui.painter().text(
-        cell(3).center(),
+        cell(4).center(),
         egui::Align2::CENTER_CENTER,
         format_time(t.duration_ms),
-        theme::regular(14.0),
-        other,
+        theme::regular(13.0),
+        other_color,
     );
 
+    let mut action = RowAction::default();
     if !t.playable {
-        response.on_hover_text("This song is not available");
-        return false;
+        response.on_hover_text("Not available");
+        return action;
     }
     let on_number = response
         .interact_pointer_pos()
         .is_some_and(|p| p.x < rect.left() + cols[1].0);
-    response.double_clicked() || (response.clicked() && on_number)
+    action.play = response.double_clicked() || (response.clicked() && on_number);
+    response.context_menu(|ui| {
+        if ui.button("Play").clicked() {
+            action.play = true;
+        }
+        if ui.button("Add to queue").clicked() {
+            action.queue = true;
+        }
+    });
+    action
 }
 
 pub fn format_time(ms: u32) -> String {
     let s = ms / 1000;
-    format!("{}:{:02}", s / 60, s % 60)
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }

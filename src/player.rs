@@ -142,17 +142,20 @@ impl PlayerCtl {
                     .album
                     .covers
                     .iter()
-                    .find(|i| i.size == ImageSize::SMALL)
+                    .find(|i| i.size == ImageSize::DEFAULT)
                     .or(t.album.covers.first())
                     .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
                 Track {
                     uri: t.id.to_uri(),
                     name: t.name,
                     artists: join_names(t.artists.iter().map(|a| a.name.clone())),
+                    year: t.album.date.year().clamp(0, 9999) as u16,
                     album: t.album.name,
                     duration_ms: t.duration.max(0) as u32,
                     image_url: cover,
                     playable: true,
+                    is_episode: false,
+                    added_at: String::new(),
                 }
             })
             .collect()

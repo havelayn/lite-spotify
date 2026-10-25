@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod auth;
 mod config;
+mod fun;
 mod player;
 mod theme;
 mod widgets;
@@ -26,8 +27,8 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_title("lite-spotify")
-            .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([680.0, 420.0]),
+            .with_inner_size([1200.0, 760.0])
+            .with_min_inner_size([860.0, 540.0]),
         ..Default::default()
     };
     eframe::run_native(
