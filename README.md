@@ -73,3 +73,8 @@ cargo build --release
 
 The program ends up in `target\release\lite-spotify.exe`. On Linux you also need the
 ALSA headers (`sudo apt install libasound2-dev`).
+
+## Credits
+
+The app uses the [Inter](https://rsms.me/inter/) font by Rasmus Andersson, under the
+SIL Open Font License (see `assets/fonts/Inter-LICENSE.txt`).
