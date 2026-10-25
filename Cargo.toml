@@ -1,0 +1,50 @@
+[package]
+name = "lite-spotify"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight Spotify Premium player for Windows (egui + librespot)"
+license = "MIT"
+publish = false
+
+[dependencies]
+# GUI. glow (OpenGL) uses noticeably less memory than the wgpu renderer.
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "system_fonts",
+    "clipboard",
+    "links",
+    "wayland",
+    "x11",
+] }
+
+# Playback. Pinned to a commit on librespot's dev branch: it carries fixes made
+# after the 0.8.0 release (CDN fallback, dealer connection), see CHANGELOG there.
+librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "99b6088bf3ea028f90192676ac1a337fa4b2ed12", default-features = false, features = ["native-tls"] }
+librespot-playback = { git = "https://github.com/librespot-org/librespot", rev = "99b6088bf3ea028f90192676ac1a337fa4b2ed12", default-features = false, features = ["native-tls", "rodio-backend"] }
+librespot-metadata = { git = "https://github.com/librespot-org/librespot", rev = "99b6088bf3ea028f90192676ac1a337fa4b2ed12", default-features = false, features = ["native-tls"] }
+
+# Web API. reqwest 0.12 is the version librespot already depends on, so the app
+# does not carry two copies of it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "system-proxy"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+directories = "6"
+open = "5"
+url = "2"
+rand = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
