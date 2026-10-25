@@ -11,7 +11,7 @@ use rand::Rng;
 
 use super::{PARTY, sample};
 use crate::api::Track;
-use crate::theme::{self, MUTED, SUBDUED};
+use crate::theme::{self, muted, subdued};
 use crate::widgets::{self, ButtonStyle};
 
 const HEIGHT: f32 = 0.78;
@@ -432,14 +432,14 @@ impl Claw {
                         ui.label(
                             RichText::new("Keys: ← → to move, ↓ to drop")
                                 .small()
-                                .color(MUTED),
+                                .color(muted()),
                         );
                     }
                 }
                 ui.label(
                     RichText::new(format!("{} prizes left", self.capsules.len()))
                         .small()
-                        .color(SUBDUED),
+                        .color(subdued()),
                 );
             });
         });
@@ -521,7 +521,7 @@ impl Claw {
             egui::Align2::CENTER_CENTER,
             "PRIZE",
             theme::bold((w * 0.03).max(10.0)),
-            MUTED,
+            muted(),
         );
         let wall = Rect::from_min_max(
             to_screen(pos2(CHUTE - 0.012, HEIGHT - 0.16)),

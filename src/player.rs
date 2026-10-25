@@ -14,7 +14,8 @@ use librespot_core::error::ErrorKind;
 use librespot_core::session::Session;
 use librespot_core::{Error as SpotError, SpotifyUri};
 use librespot_metadata::image::ImageSize;
-use librespot_metadata::{Metadata, Playlist as SpPlaylist, Track as SpTrack};
+use librespot_metadata::lyrics::SyncType;
+use librespot_metadata::{Lyrics as SpLyrics, Metadata, Playlist as SpPlaylist, Track as SpTrack};
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
@@ -55,6 +56,25 @@ pub enum PlayerMsg {
     Unavailable {
         uri: String,
     },
+}
+
+/// The words of a song.
+#[derive(Debug, Clone)]
+pub struct Lyrics {
+    /// Each line has a start time, so the current line can be highlighted.
+    pub synced: bool,
+    pub lines: Vec<LyricLine>,
+    /// Who provided them (shown small underneath, as Spotify asks).
+    pub provider: String,
+    /// The colours Spotify picked for these lyrics: background, text, and the
+    /// line being sung.
+    pub colors: Option<[[u8; 3]; 3]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LyricLine {
+    pub start_ms: u32,
+    pub words: String,
 }
 
 enum Cmd {
@@ -147,6 +167,40 @@ impl PlayerCtl {
         let playlist = SpPlaylist::get(&session, &uri).await?;
         let uris: Vec<SpotifyUri> = playlist.tracks().take(1000).cloned().collect();
         Ok(tracks_from_uris(&session, uris).await)
+    }
+
+    /// The lyrics of a song, from Spotify's own lyrics service.
+    pub async fn lyrics(&self, uri: &str) -> Result<Lyrics> {
+        let session = self.session()?;
+        let SpotifyUri::Track { id } = SpotifyUri::from_uri(uri)? else {
+            return Err(anyhow!("Only songs have lyrics"));
+        };
+        let lyrics = SpLyrics::get(&session, &id)
+            .await
+            .map_err(|e| anyhow!("Spotify has no lyrics for this song ({e})"))?;
+        let synced = lyrics.lyrics.sync_type == SyncType::LineSynced;
+        let lines = lyrics
+            .lyrics
+            .lines
+            .into_iter()
+            .map(|l| LyricLine {
+                start_ms: l.start_time_ms.parse().unwrap_or(0),
+                words: l.words,
+            })
+            .collect();
+        let rgb = |argb: i32| {
+            let [_, r, g, b] = argb.to_be_bytes();
+            [r, g, b]
+        };
+        let c = &lyrics.colors;
+        let colors =
+            (c.background != 0).then(|| [rgb(c.background), rgb(c.text), rgb(c.highlight_text)]);
+        Ok(Lyrics {
+            synced,
+            lines,
+            provider: lyrics.lyrics.provider_display_name,
+            colors,
+        })
     }
 
     /// Songs similar to `seed_uri`, from Spotify's own autoplay radio (the same

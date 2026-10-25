@@ -9,7 +9,7 @@ use rand::seq::SliceRandom;
 
 use super::{PARTY, sample, song_card};
 use crate::api::Track;
-use crate::theme::{self, MUTED, RAISED, SUBDUED, TEXT};
+use crate::theme::{self, muted, raised, subdued};
 use crate::widgets::{self, ButtonStyle};
 
 const CARD_COUNT: usize = 6;
@@ -57,7 +57,7 @@ impl Cards {
         ui.horizontal(|ui| {
             deal = widgets::button(ui, "Deal new cards", ButtonStyle::Ghost, 13.0).clicked();
             if self.reported {
-                ui.label(RichText::new("The others are what you could have had.").color(MUTED));
+                ui.label(RichText::new("The others are what you could have had.").color(muted()));
             }
         });
         if deal {
@@ -121,11 +121,11 @@ impl Cards {
             if turn < 0.5 {
                 paint_card_back(ui, shown, i);
             } else {
-                let fill = if chosen { RAISED } else { theme::SURFACE };
+                let fill = if chosen { raised() } else { theme::surface() };
                 let stroke = if chosen {
                     theme::accent()
                 } else {
-                    theme::BORDER
+                    theme::border()
                 };
                 song_card(ui, shown, &self.hand[i], fill, stroke);
                 if !chosen {
@@ -194,7 +194,7 @@ fn paint_card_back(ui: &Ui, rect: Rect, i: usize) {
             egui::Align2::CENTER_CENTER,
             "?",
             theme::bold(inner.width() * 0.3),
-            theme::ON_ACCENT,
+            theme::on_accent(),
         );
     }
 }
@@ -250,14 +250,14 @@ impl Duel {
                 ui.label(
                     RichText::new(format!("{stage} · match {} of {matches}", self.index + 1))
                         .font(theme::bold(16.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
             }
             if widgets::button(ui, "Start over", ButtonStyle::Ghost, 13.0).clicked() {
                 self.start(pool, version);
             }
         });
-        ui.label(RichText::new("Click the song you'd rather hear right now.").color(SUBDUED));
+        ui.label(RichText::new("Click the song you'd rather hear right now.").color(subdued()));
         ui.add_space(14.0);
 
         let full = ui.available_rect_before_wrap();
@@ -270,7 +270,7 @@ impl Duel {
 
         if self.finished {
             let rect = Rect::from_min_size(full.min, vec2(card_w, card_h));
-            song_card(ui, rect, &self.round[0], RAISED, theme::accent());
+            song_card(ui, rect, &self.round[0], raised(), theme::accent());
             return None;
         }
 
@@ -284,12 +284,12 @@ impl Duel {
             let stroke = if response.hovered() {
                 theme::accent()
             } else {
-                theme::BORDER
+                theme::border()
             };
             let fill = if response.hovered() {
-                theme::HOVER
+                theme::hover()
             } else {
-                RAISED
+                raised()
             };
             song_card(ui, rect, track, fill, stroke);
             if response.clicked() {
@@ -303,7 +303,7 @@ impl Duel {
             egui::Align2::CENTER_CENTER,
             "VS",
             theme::bold(16.0),
-            theme::ON_ACCENT,
+            theme::on_accent(),
         );
 
         let winner = chosen?;
@@ -336,12 +336,12 @@ impl TimeMachine {
         let (Some((&first, _)), Some((&last, _))) =
             (per_year.first_key_value(), per_year.last_key_value())
         else {
-            ui.label(RichText::new("These songs have no release years.").color(SUBDUED));
+            ui.label(RichText::new("These songs have no release years.").color(subdued()));
             return None;
         };
         let most = *per_year.values().max().unwrap_or(&1);
 
-        ui.label(RichText::new("Click a year, or pick a whole decade below.").color(SUBDUED));
+        ui.label(RichText::new("Click a year, or pick a whole decade below.").color(subdued()));
         ui.add_space(8.0);
 
         // Bar chart of songs per year.
@@ -358,7 +358,7 @@ impl TimeMachine {
         p.hline(
             chart.x_range(),
             chart.bottom(),
-            Stroke::new(1.0, theme::BORDER),
+            Stroke::new(1.0, theme::border()),
         );
         let mut result = None;
         for year in first..=last {
@@ -385,7 +385,7 @@ impl TimeMachine {
                     egui::Align2::LEFT_TOP,
                     year.to_string(),
                     theme::regular(11.0),
-                    MUTED,
+                    muted(),
                 );
             }
             if count > 0 {
@@ -428,7 +428,7 @@ pub fn rediscover_ui(ui: &mut Ui, pool: &[Track]) -> Option<(Vec<Track>, String)
     if dated.len() < 4 {
         ui.label(
             RichText::new("This only works with lists that remember when songs were added, like Liked Songs and playlists.")
-                .color(SUBDUED),
+                .color(subdued()),
         );
         return None;
     }
@@ -446,8 +446,8 @@ pub fn rediscover_ui(ui: &mut Ui, pool: &[Track]) -> Option<(Vec<Track>, String)
     ui.painter().rect(
         rect,
         CornerRadius::same(12),
-        RAISED,
-        Stroke::new(1.0, theme::BORDER),
+        raised(),
+        Stroke::new(1.0, theme::border()),
         egui::StrokeKind::Inside,
     );
     let mut result = None;
@@ -460,11 +460,11 @@ pub fn rediscover_ui(ui: &mut Ui, pool: &[Track]) -> Option<(Vec<Track>, String)
             ui.label(
                 RichText::new(format!("{} songs you saved long ago", oldest.len()))
                     .font(theme::bold(20.0))
-                    .color(TEXT),
+                    .color(theme::text()),
             );
-            ui.label(RichText::new(format!("Added between {from} and {to}.")).color(SUBDUED));
+            ui.label(RichText::new(format!("Added between {from} and {to}.")).color(subdued()));
             ui.label(
-                RichText::new("Remember these? Here's a shuffled bunch of them.").color(SUBDUED),
+                RichText::new("Remember these? Here's a shuffled bunch of them.").color(subdued()),
             );
             ui.add_space(14.0);
             if widgets::button(ui, "Play 25 forgotten songs", ButtonStyle::Accent, 15.0).clicked() {
@@ -488,8 +488,8 @@ pub fn surprise_mix_ui(ui: &mut Ui, loading: bool) -> bool {
     ui.painter().rect(
         rect,
         CornerRadius::same(12),
-        RAISED,
-        Stroke::new(1.0, theme::BORDER),
+        raised(),
+        Stroke::new(1.0, theme::border()),
         egui::StrokeKind::Inside,
     );
     let mut clicked = false;
@@ -502,14 +502,14 @@ pub fn surprise_mix_ui(ui: &mut Ui, loading: bool) -> bool {
             ui.label(
                 RichText::new("30 songs from all over your library")
                     .font(theme::bold(20.0))
-                    .color(TEXT),
+                    .color(theme::text()),
             );
-            ui.label(RichText::new("Takes a handful of songs from Liked Songs and up to six random playlists, then shuffles them together.").color(SUBDUED));
+            ui.label(RichText::new("Takes a handful of songs from Liked Songs and up to six random playlists, then shuffles them together.").color(subdued()));
             ui.add_space(14.0);
             if loading {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(18.0).color(theme::accent()));
-                    ui.label(RichText::new("Mixing…").color(SUBDUED));
+                    ui.label(RichText::new("Mixing…").color(subdued()));
                 });
             } else if widgets::button(ui, "Make me a mix", ButtonStyle::Accent, 15.0).clicked() {
                 clicked = true;
@@ -517,4 +517,94 @@ pub fn surprise_mix_ui(ui: &mut Ui, loading: bool) -> bool {
         },
     );
     clicked
+}
+
+// ---- Daily Pick ----
+
+/// One song per day, the same all day long. Each song gets a score from the
+/// date and its link; the highest score wins. Adding songs to the list rarely
+/// changes today's pick.
+#[derive(Default)]
+pub struct Daily {
+    /// The date the song was revealed for.
+    revealed: Option<jiff::civil::Date>,
+}
+
+impl Daily {
+    pub fn ui(&mut self, ui: &mut Ui, pool: &[Track]) -> Option<(Vec<Track>, String)> {
+        let today = jiff::Zoned::now().date();
+        let pick = daily_pick(pool, today)?;
+        let revealed = self.revealed == Some(today);
+        ui.label(
+            RichText::new(today.strftime("%A %-d %B %Y").to_string())
+                .font(theme::bold(16.0))
+                .color(theme::text()),
+        );
+        ui.label(RichText::new("Come back tomorrow for a new one.").color(subdued()));
+        ui.add_space(14.0);
+
+        let full = ui.available_rect_before_wrap();
+        let card = Rect::from_min_size(full.min, vec2(full.width().min(320.0), 150.0));
+        let response = ui.allocate_rect(card, Sense::click());
+        if revealed {
+            song_card(ui, card, pick, raised(), theme::accent());
+            return None;
+        }
+        let hovered = response.hovered();
+        ui.painter().rect(
+            card,
+            CornerRadius::same(10),
+            if hovered { theme::hover() } else { raised() },
+            Stroke::new(1.5, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            card.center() - vec2(0.0, 12.0),
+            egui::Align2::CENTER_CENTER,
+            "?",
+            theme::bold(44.0),
+            theme::accent(),
+        );
+        ui.painter().text(
+            card.center() + vec2(0.0, 36.0),
+            egui::Align2::CENTER_CENTER,
+            "Click to see today's song",
+            theme::regular(13.0),
+            subdued(),
+        );
+        if response.clicked() {
+            self.revealed = Some(today);
+            return Some((vec![pick.clone()], "Today's pick".to_string()));
+        }
+        None
+    }
+}
+
+fn daily_pick(pool: &[Track], date: jiff::civil::Date) -> Option<&Track> {
+    use std::hash::{Hash, Hasher};
+    pool.iter().max_by_key(|t| {
+        // A fixed hash (not the randomised std one), so the pick is the same all day.
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        (date.year(), date.month(), date.day(), &t.uri).hash(&mut h);
+        h.finish()
+    })
+}
+
+/// The FNV-1a hash: tiny and the same on every run.
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        // Mix the bits a little more so nearby dates give unrelated picks.
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^ (x >> 33)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= *b as u64;
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
 }

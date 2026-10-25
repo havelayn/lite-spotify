@@ -18,9 +18,23 @@ What it can do:
 - **Similar songs:** after a single song, or when a list ends, lite-spotify keeps playing
   shuffled songs in the same style (from Spotify's own radio). Turn it off in Settings.
 - **Podcasts:** the shows you follow and their episodes.
+- **Lyrics:** click **Lyrics** under the volume. The line being sung is highlighted (click a
+  line to jump there). **Full screen** turns it into karaoke on the song's own colour;
+  press Esc to leave. Not every song has lyrics.
+- **Mini player:** the small-window button at the top right makes a little player that
+  stays on top of other windows. The arrows button brings the full window back.
+- **Tray icon (Windows):** lite-spotify has an icon next to the clock. Right-click it for
+  play/pause, next, previous, mini player and Quit. In Settings you can make closing the
+  window keep the music playing there.
+- **Stats tab:** how long you listened, your top songs and artists, and at what times you
+  listen, for the last week, month, year or all time. Kept only on your computer.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
   repeat, volume, and an **Up next** list. Right-click a song to add it to the queue.
 - **Fun tab** for when you don't know what to listen to:
+  - **Daily Pick:** one song from your list, a new one every day.
+  - **Guess the Song:** hear 5 seconds of a song from your list and pick the right title
+    out of four. Need more? +5 seconds, for fewer points. Your own song comes back
+    (paused) when you leave the game.
   - **Song Roulette:** spin the wheel.
   - **Claw Machine:** grab a mystery song (it slips sometimes).
   - **Slot Machine:** a line-up of three songs.
@@ -40,7 +54,8 @@ What it can do:
   The full list is in Settings.
 - **Update check:** when a new version is out, a banner with a **Download** button
   appears at the top.
-- **Settings:** accent colour, turn the Fun tab on or off, account and log file.
+- **Settings:** dark or light look, accent colour (or **Album**: the colour of the cover
+  that is playing), turn the Fun tab on or off, account and log file.
 
 Streaming only: nothing is downloaded or saved, and Premium is required for playback.
 
@@ -94,7 +109,7 @@ Next time you start the app you are signed in automatically.
 
 - **Where are my settings?** In `%APPDATA%\lite-spotify` (paste that into the Explorer
   address bar). `config.json` holds your Client ID, login token and volume; `session.json` the song and
-  queue to continue with;
+  queue to continue with; `history.jsonl` your listening history for the Stats tab;
   the `player` folder holds the player's saved login. `lite-spotify.log` is the log file.
   Please attach it when you report a bug.
 - **Sign out / use a different Client ID:** open the **Settings** tab.

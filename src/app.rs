@@ -16,9 +16,11 @@ use crate::auth;
 use crate::config::{self, Config, Repeat};
 use crate::fun::{Fun, FunAction};
 use crate::media::{self, MediaKey};
-use crate::player::{PlayerCtl, PlayerMsg};
+use crate::player::{Lyrics, PlayerCtl, PlayerMsg};
 use crate::session::Session;
+use crate::stats;
 use crate::theme;
+use crate::tray::{Tray, TrayCmd};
 use crate::update::{self, Release};
 use crate::widgets;
 
@@ -64,6 +66,8 @@ enum Msg {
     Cover {
         url: String,
         image: egui::ColorImage,
+        /// The cover's main colour, for the "Album" accent.
+        color: Option<egui::Color32>,
     },
     Player(PlayerMsg),
     /// Whether a song is in Liked Songs.
@@ -79,6 +83,11 @@ enum Msg {
     },
     /// A newer version is out.
     Update(Release),
+    Tray(TrayCmd),
+    Lyrics {
+        uri: String,
+        result: Result<Lyrics, String>,
+    },
     MediaKey(MediaKey),
 }
 
@@ -117,6 +126,7 @@ enum Tab {
     Search,
     Podcasts,
     Fun,
+    Stats,
     Settings,
 }
 
@@ -314,6 +324,48 @@ pub struct App {
     saved_session: Option<Session>,
     /// A newer version that can be downloaded, until the user hides the banner.
     update: Option<Release>,
+
+    /// The lyrics view is shown instead of the tab.
+    lyrics_open: bool,
+    /// Full-screen karaoke: only the lyrics, big.
+    karaoke: bool,
+    /// The lyrics of this song (`None` while loading).
+    lyrics: Option<(String, Option<Result<Lyrics, String>>)>,
+    /// The lyrics line that was last scrolled into view.
+    lyrics_scrolled_to: Option<usize>,
+    /// Guess the Song is playing a snippet. The player panel keeps showing the
+    /// song from before, which comes back (paused) when the quiz ends.
+    quiz: Option<QuizSnippet>,
+
+    /// The song being listened to, for the stats: how long so far, and since
+    /// when it has been playing.
+    listening: Option<(Track, u64)>,
+    listening_since: Option<Instant>,
+    /// The Stats tab's data, loaded while the tab is open.
+    stats: Option<StatsView>,
+
+    /// The icon in the notification area (Windows only).
+    tray: Option<Tray>,
+    tray_tooltip: String,
+    /// In the mini player: the window size to go back to.
+    mini: Option<egui::Vec2>,
+    /// "Quit" was chosen in the tray menu, so closing really closes.
+    quitting: bool,
+    /// The main colour of the current cover, for the "Album" accent.
+    cover_color: Option<egui::Color32>,
+}
+
+struct StatsView {
+    plays: Vec<stats::Play>,
+    period: stats::Period,
+    summary: stats::Summary,
+}
+
+struct QuizSnippet {
+    uri: String,
+    length_ms: u32,
+    /// When to pause; set once the snippet really starts.
+    stop_at: Option<Instant>,
 }
 
 /// When the sleep timer pauses the music.
@@ -350,8 +402,14 @@ impl App {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("could not create the HTTP client");
-        let config = Config::load();
-        theme::setup(&cc.egui_ctx, &config.accent);
+        #[allow(unused_mut)]
+        let mut config = Config::load();
+        // Screenshots of the light look in demo mode (debug builds only).
+        #[cfg(debug_assertions)]
+        if std::env::var("LITE_SPOTIFY_DEMO_LIGHT").is_ok() {
+            config.light_theme = true;
+        }
+        theme::setup(&cc.egui_ctx, &config.accent, config.light_theme);
 
         let mut app = Self {
             rt,
@@ -408,6 +466,19 @@ impl App {
             sleep_fading: false,
             saved_session: None,
             update: None,
+            lyrics_open: false,
+            karaoke: false,
+            lyrics: None,
+            lyrics_scrolled_to: None,
+            quiz: None,
+            listening: None,
+            listening_since: None,
+            stats: None,
+            tray: None,
+            tray_tooltip: String::new(),
+            mini: None,
+            quitting: false,
+            cover_color: None,
         };
 
         #[cfg(debug_assertions)]
@@ -418,6 +489,8 @@ impl App {
 
         let outbox = app.outbox.clone();
         app.media = media::Controls::new(cc, move |key| outbox.send(Msg::MediaKey(key)));
+        let outbox = app.outbox.clone();
+        app.tray = Tray::new(move |cmd| outbox.send(Msg::Tray(cmd)));
         if app.config.resume_session {
             app.saved_session = Session::load();
         }
@@ -757,6 +830,67 @@ impl App {
                     self.dialog = Some(Dialog::NewPlaylist { name, tracks });
                 }
             }
+            FunAction::QuizPlay {
+                track,
+                start_ms,
+                length_ms,
+            } => self.quiz_play(&track, start_ms, length_ms),
+            FunAction::QuizEnd => self.end_quiz(),
+        }
+    }
+
+    /// Plays a few seconds of `track` for Guess the Song, without showing it.
+    fn quiz_play(&mut self, track: &Track, start_ms: u32, length_ms: u32) {
+        let Some(player) = &self.player else { return };
+        if !self.player_ready() {
+            self.notify("The player is not connected yet. Please wait a moment.");
+            return;
+        }
+        if self.quiz.is_none() {
+            // Remember where the current song was; it comes back paused afterwards.
+            self.now.position_ms = self.now.position_ms();
+            self.now.since = None;
+            self.now.playing = false;
+            self.now.loading = false;
+        }
+        player.load(&track.uri, start_ms);
+        self.quiz = Some(QuizSnippet {
+            uri: track.uri.clone(),
+            length_ms,
+            stop_at: None,
+        });
+    }
+
+    /// Ends Guess the Song and loads the song from before, paused.
+    fn end_quiz(&mut self) {
+        if self.quiz.take().is_none() {
+            return;
+        }
+        let Some(player) = &self.player else { return };
+        match &self.now.track {
+            Some(t) => {
+                player.load_paused(&t.uri, self.now.position_ms);
+                self.now.loading = true;
+            }
+            None => player.stop(),
+        }
+    }
+
+    /// Pauses the quiz snippet when its time is up.
+    fn tick_quiz(&mut self, ctx: &egui::Context) {
+        let Some(stop_at) = self.quiz.as_ref().and_then(|q| q.stop_at) else {
+            return;
+        };
+        let left = stop_at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            if let Some(p) = &self.player {
+                p.pause();
+            }
+            if let Some(q) = &mut self.quiz {
+                q.stop_at = None;
+            }
+        } else {
+            ctx.request_repaint_after(left);
         }
     }
 
@@ -804,6 +938,7 @@ impl App {
         if tracks.is_empty() {
             return;
         }
+        self.quiz = None;
         self.playing_source = source;
         self.user_queued = 0;
         self.skipped_in_a_row = 0;
@@ -1206,6 +1341,186 @@ impl App {
         });
     }
 
+    // --------------------------------------------------------------- lyrics
+
+    /// Loads the lyrics of the current song while the lyrics view is open.
+    fn update_lyrics(&mut self) {
+        if !self.lyrics_open {
+            return;
+        }
+        let Some(track) = &self.now.track else {
+            self.lyrics = None;
+            return;
+        };
+        if self
+            .lyrics
+            .as_ref()
+            .is_some_and(|(uri, _)| *uri == track.uri)
+        {
+            return;
+        }
+        let uri = track.uri.clone();
+        self.lyrics_scrolled_to = None;
+        if track.is_episode {
+            self.lyrics = Some((uri, Some(Err("Podcasts don't have lyrics.".into()))));
+            return;
+        }
+        let Some(player) = self.player.clone() else {
+            return;
+        };
+        self.lyrics = Some((uri.clone(), None));
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = player.lyrics(&uri).await.map_err(|e| format!("{e:#}"));
+            if let Err(e) = &result {
+                log::info!("No lyrics: {e}");
+            }
+            outbox.send(Msg::Lyrics { uri, result });
+        });
+    }
+
+    fn set_karaoke(&mut self, ctx: &egui::Context, on: bool) {
+        self.karaoke = on;
+        if on {
+            self.lyrics_open = true;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+
+    // ---------------------------------------------------------------- stats
+
+    /// Keeps count of how long the current song has been playing. Runs before
+    /// every frame.
+    fn track_listening(&mut self) {
+        let current = self.now.track.clone().filter(|_| self.quiz.is_none());
+        let changed = match (&self.listening, &current) {
+            (Some((t, _)), Some(c)) => t.uri != c.uri,
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.finish_listen();
+            self.listening = current.filter(|t| !t.is_episode).map(|t| (t.clone(), 0));
+        }
+        let now = Instant::now();
+        if let (Some(since), Some((_, ms))) = (self.listening_since, &mut self.listening) {
+            *ms += now.duration_since(since).as_millis() as u64;
+        }
+        self.listening_since = (self.now.playing && self.listening.is_some()).then_some(now);
+    }
+
+    /// Saves the current listen to the history if it was long enough.
+    fn finish_listen(&mut self) {
+        if let Some(since) = self.listening_since.take()
+            && let Some((_, ms)) = &mut self.listening
+        {
+            *ms += since.elapsed().as_millis() as u64;
+        }
+        if let Some((track, ms)) = self.listening.take()
+            && ms >= stats::MIN_LISTEN_MS
+        {
+            stats::record(&stats::Play {
+                t: jiff::Timestamp::now().as_second(),
+                uri: track.uri,
+                name: track.name,
+                artists: track.artists,
+                ms,
+            });
+        }
+    }
+
+    fn show_stats(&mut self, period: stats::Period) {
+        let plays = match self.stats.take() {
+            Some(view) => view.plays,
+            None => stats::load(),
+        };
+        let summary = stats::summarize(&plays, period);
+        self.stats = Some(StatsView {
+            plays,
+            period,
+            summary,
+        });
+    }
+
+    // ------------------------------------------------ mini player and tray
+
+    /// Switches between the full window and the small always-on-top player.
+    fn set_mini(&mut self, ctx: &egui::Context, on: bool) {
+        use egui::ViewportCommand as V;
+        if on && self.mini.is_none() {
+            if self.karaoke {
+                self.set_karaoke(ctx, false);
+            }
+            let size = ctx
+                .input(|i| i.viewport().inner_rect.map(|r| r.size()))
+                .unwrap_or(egui::vec2(1200.0, 760.0));
+            self.mini = Some(size);
+            ctx.send_viewport_cmd(V::MinInnerSize(egui::vec2(300.0, 116.0)));
+            ctx.send_viewport_cmd(V::InnerSize(egui::vec2(400.0, 116.0)));
+            ctx.send_viewport_cmd(V::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        } else if !on && let Some(size) = self.mini.take() {
+            ctx.send_viewport_cmd(V::WindowLevel(egui::WindowLevel::Normal));
+            ctx.send_viewport_cmd(V::MinInnerSize(egui::vec2(860.0, 540.0)));
+            ctx.send_viewport_cmd(V::InnerSize(size.max(egui::vec2(860.0, 540.0))));
+        }
+    }
+
+    /// With the "Album" accent, uses the cover's colour (or the default accent
+    /// when the cover is mostly grey).
+    fn apply_album_accent(&self, ctx: &egui::Context) {
+        if self.config.accent == theme::ALBUM_ACCENT {
+            theme::set_accent_color(ctx, self.cover_color.unwrap_or(theme::ACCENTS[0].1));
+        }
+    }
+
+    fn show_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn on_tray(&mut self, ctx: &egui::Context, cmd: TrayCmd) {
+        match cmd {
+            TrayCmd::Show => Self::show_window(ctx),
+            TrayCmd::PlayPause => self.toggle_play(),
+            TrayCmd::Next if self.now.track.is_some() => self.next(),
+            TrayCmd::Previous if self.now.track.is_some() => self.previous(),
+            TrayCmd::MiniPlayer => {
+                Self::show_window(ctx);
+                self.set_mini(ctx, true);
+            }
+            TrayCmd::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            _ => {}
+        }
+    }
+
+    /// With "close to tray" on, closing the window hides it instead; the music
+    /// keeps playing and the tray icon brings it back.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let close = ctx.input(|i| i.viewport().close_requested());
+        if close && self.config.close_to_tray && self.tray.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.save_session();
+        }
+    }
+
+    /// Shows the song in the tray icon's tooltip.
+    fn update_tray(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        let text = match &self.now.track {
+            Some(t) => format!("{} \u{2014} {}", t.name, t.artists),
+            None => "lite-spotify".to_string(),
+        };
+        if text != self.tray_tooltip {
+            tray.set_tooltip(&text);
+            self.tray_tooltip = text;
+        }
+    }
+
     // ---------------------------------------------------------- sleep timer
 
     fn set_sleep(&mut self, sleep: Option<Sleep>) {
@@ -1302,6 +1617,7 @@ impl App {
 
     /// Jumps to a song further down the queue (from the Up next list).
     fn jump_to(&mut self, index: usize) {
+        self.quiz = None;
         self.user_queued = self
             .user_queued
             .saturating_sub(index.saturating_sub(self.queue_pos));
@@ -1309,6 +1625,7 @@ impl App {
     }
 
     fn next(&mut self) {
+        self.quiz = None;
         self.user_queued = self.user_queued.saturating_sub(1);
         if self.play_at(self.queue_pos + 1, true) {
             return;
@@ -1339,6 +1656,7 @@ impl App {
     }
 
     fn previous(&mut self) {
+        self.end_quiz();
         if self.now.position_ms() > 3000 || self.queue_pos == 0 {
             self.seek(0);
         } else {
@@ -1347,6 +1665,7 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        self.end_quiz();
         let Some(player) = &self.player else { return };
         if self.now.track.is_none() {
             return;
@@ -1359,6 +1678,7 @@ impl App {
     }
 
     fn seek(&mut self, position_ms: u32) {
+        self.end_quiz();
         if let Some(p) = &self.player {
             let duration = self.now.track.as_ref().map_or(0, |t| t.duration_ms);
             let position_ms = position_ms.min(duration.saturating_sub(500));
@@ -1425,11 +1745,35 @@ impl App {
             let img = img.thumbnail(300, 300).to_rgba8();
             let size = [img.width() as usize, img.height() as usize];
             let image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-            outbox.send(Msg::Cover { url, image });
+            let color = theme::cover_color(img.as_raw());
+            outbox.send(Msg::Cover { url, image, color });
         });
     }
 
     fn on_player_msg(&mut self, msg: PlayerMsg) {
+        if let Some(quiz) = &mut self.quiz {
+            match &msg {
+                PlayerMsg::Playing { uri, .. } if *uri == quiz.uri => {
+                    if quiz.stop_at.is_none() {
+                        quiz.stop_at =
+                            Some(Instant::now() + Duration::from_millis(quiz.length_ms as u64));
+                        if let Some(fun) = &mut self.fun {
+                            fun.quiz_started();
+                        }
+                    }
+                    return;
+                }
+                PlayerMsg::Unavailable { uri } if *uri == quiz.uri => {
+                    if let Some(fun) = &mut self.fun {
+                        fun.quiz_unavailable();
+                    }
+                    return;
+                }
+                // Nothing to preload while the quiz plays.
+                PlayerMsg::PreloadNext => return,
+                _ => {}
+            }
+        }
         let current = self.now.track.as_ref().map(|t| t.uri.clone());
         let is_current = |uri: &str| current.as_deref() == Some(uri);
         match msg {
@@ -1468,6 +1812,8 @@ impl App {
                 }
             }
             PlayerMsg::EndOfTrack { uri } if is_current(&uri) => {
+                // Counts each time round when a song repeats.
+                self.finish_listen();
                 if self.sleep == Some(Sleep::EndOfSong) {
                     self.set_sleep(None);
                     self.stop_at_end();
@@ -1614,9 +1960,11 @@ impl App {
                         self.on_fun_action(action);
                     }
                 }
-                Msg::Cover { url, image } => {
+                Msg::Cover { url, image, color } => {
                     let wanted = self.now.track.as_ref().and_then(|t| t.image_url.as_ref());
                     if wanted == Some(&url) {
+                        self.cover_color = color;
+                        self.apply_album_accent(ctx);
                         let texture =
                             ctx.load_texture("cover", image, egui::TextureOptions::LINEAR);
                         self.cover = Some((url, texture));
@@ -1633,7 +1981,15 @@ impl App {
                     result,
                 } => self.on_like_done(track, liked, result),
                 Msg::Update(release) => self.update = Some(release),
+                Msg::Lyrics { uri, result } => {
+                    if let Some((wanted, pending)) = &mut self.lyrics
+                        && *wanted == uri
+                    {
+                        *pending = Some(result);
+                    }
+                }
                 Msg::MediaKey(key) => self.on_media_key(key),
+                Msg::Tray(cmd) => self.on_tray(ctx, cmd),
             }
         }
     }
@@ -1763,6 +2119,37 @@ impl App {
                 };
             }
             "settings" => self.tab = Tab::Settings,
+            "mini" => self.mini = Some(egui::vec2(1200.0, 760.0)),
+            "stats" => self.tab = Tab::Stats,
+            "lyrics" | "karaoke" => {
+                let lines = [
+                    "First line of the song",
+                    "Here comes the second one",
+                    "",
+                    "This line is being sung right now",
+                    "And this one comes next",
+                    "Then a longer line that goes on for quite a while",
+                    "Last line",
+                ];
+                self.lyrics_open = true;
+                self.karaoke = which == "karaoke";
+                self.lyrics = Some((
+                    tracks[2].uri.clone(),
+                    Some(Ok(Lyrics {
+                        synced: true,
+                        lines: lines
+                            .iter()
+                            .enumerate()
+                            .map(|(i, w)| crate::player::LyricLine {
+                                start_ms: i as u32 * 20_000,
+                                words: w.to_string(),
+                            })
+                            .collect(),
+                        provider: "Demo".into(),
+                        colors: Some([[0x8d, 0x2a, 0x4a], [0x14, 0x08, 0x10], [0xff, 0xff, 0xff]]),
+                    })),
+                ));
+            }
             "sorted" => {
                 self.library.filter = "song 1".into();
                 self.library.sort = Some((widgets::SortColumn::Title, false));

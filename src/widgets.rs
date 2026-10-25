@@ -6,7 +6,7 @@ use eframe::egui::{
 };
 
 use crate::api::Track;
-use crate::theme::{self, HOVER, MUTED, ON_ACCENT, RAISED, SUBDUED, TEXT};
+use crate::theme::{self, hover, muted, on_accent, raised, subdued};
 
 /// Runs `add_contents` in a child `Ui` placed by `builder` (usually a rect inside
 /// space that is already allocated), without moving the parent's layout cursor.
@@ -50,6 +50,10 @@ pub enum Icon {
     Repeat,
     RepeatOne,
     Plus,
+    /// A small window inside a big one.
+    MiniPlayer,
+    /// Arrows pointing outwards.
+    Expand,
 }
 
 /// Draws `icon` to fill `rect`. Icons are drawn in a -0.5..0.5 square.
@@ -195,6 +199,24 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             p.line_segment([pt(-0.32, 0.0), pt(0.32, 0.0)], line);
             p.line_segment([pt(0.0, -0.32), pt(0.0, 0.32)], line);
         }
+        Icon::MiniPlayer => {
+            p.rect_stroke(
+                Rect::from_min_max(pt(-0.42, -0.32), pt(0.42, 0.32)),
+                CornerRadius::same((s * 0.06) as u8),
+                line,
+                egui::StrokeKind::Middle,
+            );
+            p.rect_filled(
+                Rect::from_min_max(pt(0.0, 0.02), pt(0.3, 0.22)),
+                CornerRadius::same((s * 0.03) as u8),
+                color,
+            );
+        }
+        Icon::Expand => {
+            p.line_segment([pt(-0.28, 0.28), pt(0.28, -0.28)], line);
+            head(0.26, -0.26, 0.707, -0.707);
+            head(-0.26, 0.26, -0.707, 0.707);
+        }
     }
 }
 
@@ -208,13 +230,13 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool, active: bo
     };
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 10.0), sense);
     let color = if !enabled {
-        MUTED
+        muted()
     } else if active {
         theme::accent()
     } else if response.hovered() {
-        TEXT
+        theme::text()
     } else {
-        SUBDUED
+        subdued()
     };
     paint_icon(ui.painter(), rect.shrink(5.0), icon, color);
     if active {
@@ -229,8 +251,8 @@ pub fn heart_button(ui: &mut Ui, size: f32, liked: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 10.0), Sense::click());
     let (icon, color) = match (liked, response.hovered()) {
         (true, _) => (Icon::Heart, theme::accent()),
-        (false, true) => (Icon::HeartOutline, TEXT),
-        (false, false) => (Icon::HeartOutline, SUBDUED),
+        (false, true) => (Icon::HeartOutline, theme::text()),
+        (false, false) => (Icon::HeartOutline, subdued()),
     };
     paint_icon(ui.painter(), rect.shrink(5.0), icon, color);
     response
@@ -249,7 +271,7 @@ pub fn play_button(ui: &mut Ui, diameter: f32, playing: bool, enabled: bool) -> 
     } else {
         1.0
     };
-    let fill = if enabled { theme::accent() } else { MUTED };
+    let fill = if enabled { theme::accent() } else { muted() };
     ui.painter()
         .circle_filled(rect.center(), diameter / 2.0 * grow, fill);
     let icon = if playing { Icon::Pause } else { Icon::Play };
@@ -257,7 +279,7 @@ pub fn play_button(ui: &mut Ui, diameter: f32, playing: bool, enabled: bool) -> 
         rect.center() + vec2(if playing { 0.0 } else { diameter * 0.03 }, 0.0),
         Vec2::splat(diameter * 0.38 * grow),
     );
-    paint_icon(ui.painter(), icon_rect, icon, ON_ACCENT);
+    paint_icon(ui.painter(), icon_rect, icon, on_accent());
     response
 }
 
@@ -302,18 +324,18 @@ pub fn button_sized(
                 theme::accent()
             };
             ui.painter().rect_filled(rect, radius, fill);
-            ON_ACCENT
+            on_accent()
         }
         ButtonStyle::Ghost => {
-            let fill = if hovered { HOVER } else { RAISED };
+            let fill = if hovered { hover() } else { raised() };
             ui.painter().rect(
                 rect,
                 radius,
                 fill,
-                Stroke::new(1.0, theme::BORDER),
+                Stroke::new(1.0, theme::border()),
                 egui::StrokeKind::Inside,
             );
-            TEXT
+            theme::text()
         }
     };
     let pos = rect.center() - galley.size() / 2.0;
@@ -342,14 +364,14 @@ pub fn thin_slider(ui: &mut Ui, value: f32, width: f32, enabled: bool) -> (Respo
     let active = enabled && (response.hovered() || response.dragged() || new_value.is_some());
     let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 5.0));
     let radius = CornerRadius::same(3);
-    ui.painter().rect_filled(track, radius, theme::BORDER);
+    ui.painter().rect_filled(track, radius, theme::border());
     let mut filled = track;
     filled.set_right(track.left() + track.width() * shown);
-    let fill = if enabled { theme::accent() } else { MUTED };
+    let fill = if enabled { theme::accent() } else { muted() };
     ui.painter().rect_filled(filled, radius, fill);
     if active {
         ui.painter()
-            .circle_filled(pos2(filled.right(), track.center().y), 7.0, TEXT);
+            .circle_filled(pos2(filled.right(), track.center().y), 7.0, theme::text());
     }
     (response, new_value)
 }
@@ -368,7 +390,7 @@ pub fn paint_logo(p: &Painter, rect: Rect) {
         p.rect_filled(
             Rect::from_min_max(pos2(x, bottom - s * h * 0.75), pos2(x + bar_w, bottom)),
             CornerRadius::same((bar_w / 2.0) as u8),
-            ON_ACCENT,
+            on_accent(),
         );
         x += bar_w + gap;
     }
@@ -389,9 +411,9 @@ pub fn paint_cover(ui: &Ui, rect: Rect, texture: Option<&TextureHandle>, icon: I
         }
         None => {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(radius), RAISED);
+                .rect_filled(rect, CornerRadius::same(radius), raised());
             let icon_rect = Rect::from_center_size(rect.center(), rect.size() * 0.36);
-            paint_icon(ui.painter(), icon_rect, icon, MUTED);
+            paint_icon(ui.painter(), icon_rect, icon, muted());
         }
     }
 }
@@ -401,21 +423,22 @@ pub fn nav_row(ui: &mut Ui, icon: Icon, text: &str, selected: bool, playing: boo
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
     if selected {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), theme::SELECTED);
+            .rect_filled(rect, CornerRadius::same(6), theme::selected());
         ui.painter().rect_filled(
             Rect::from_min_size(rect.left_top() + vec2(0.0, 7.0), vec2(3.0, 18.0)),
             CornerRadius::same(2),
             theme::accent(),
         );
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), HOVER);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), hover());
     }
     let color = if playing {
         theme::accent()
     } else if selected {
-        TEXT
+        theme::text()
     } else {
-        SUBDUED
+        subdued()
     };
     let icon_rect =
         Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), Vec2::splat(15.0));
@@ -528,9 +551,9 @@ fn paint_header(
         let color = if sorted.is_some() {
             theme::accent()
         } else if hovered == Some(i) {
-            TEXT
+            theme::text()
         } else {
-            MUTED
+            muted()
         };
         let (pos, align) = if i == 0 || i == 4 {
             (
@@ -559,7 +582,7 @@ fn paint_header(
     p.hline(
         rect.x_range(),
         rect.bottom() - 0.5,
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0, theme::border()),
     );
 }
 
@@ -613,9 +636,9 @@ pub fn table_row(
     let bg = if is_current {
         Some(theme::accent_soft())
     } else if hovered {
-        Some(HOVER)
+        Some(hover())
     } else if number.is_multiple_of(2) {
-        Some(theme::SURFACE)
+        Some(theme::surface())
     } else {
         None
     };
@@ -634,7 +657,7 @@ pub fn table_row(
     let num_rect = cell(0);
     let icon_rect = Rect::from_center_size(num_rect.center(), Vec2::splat(12.0));
     if hovered && t.playable {
-        paint_icon(ui.painter(), icon_rect, Icon::Play, TEXT);
+        paint_icon(ui.painter(), icon_rect, Icon::Play, theme::text());
     } else if is_current && is_playing {
         paint_icon(ui.painter(), icon_rect, Icon::Note, accent);
     } else {
@@ -643,14 +666,14 @@ pub fn table_row(
             egui::Align2::CENTER_CENTER,
             number.to_string(),
             theme::regular(13.0),
-            if is_current { accent } else { MUTED },
+            if is_current { accent } else { muted() },
         );
     }
 
     let (title_color, other_color) = match (t.playable, is_current) {
-        (false, _) => (MUTED, MUTED),
-        (true, true) => (accent, SUBDUED),
-        (true, false) => (TEXT, SUBDUED),
+        (false, _) => (muted(), muted()),
+        (true, true) => (accent, subdued()),
+        (true, false) => (theme::text(), subdued()),
     };
     let texts = [
         (1, &t.name, title_color),
@@ -685,8 +708,8 @@ pub fn table_row(
     if liked || hovered || heart_response.hovered() {
         let (icon, color) = match (liked, heart_response.hovered()) {
             (true, _) => (Icon::Heart, accent),
-            (false, true) => (Icon::HeartOutline, TEXT),
-            (false, false) => (Icon::HeartOutline, MUTED),
+            (false, true) => (Icon::HeartOutline, theme::text()),
+            (false, false) => (Icon::HeartOutline, muted()),
         };
         paint_icon(ui.painter(), heart.shrink(5.0), icon, color);
     }

@@ -15,8 +15,10 @@ pub struct Config {
     pub refresh_token: Option<String>,
     /// Volume from 0.0 to 1.0.
     pub volume: f32,
-    /// Name of the accent colour (see `theme::ACCENTS`).
+    /// Name of the accent colour (see `theme::ACCENTS`), or "Album".
     pub accent: String,
+    /// The light look instead of the dark one.
+    pub light_theme: bool,
     /// Show the Fun tab (roulette, claw machine and the other song pickers).
     pub fun_enabled: bool,
     /// Play what a Fun tab game picks straight away, instead of asking first.
@@ -32,6 +34,8 @@ pub struct Config {
     pub resume_session: bool,
     /// Look for a newer version on GitHub when the app starts.
     pub check_updates: bool,
+    /// Closing the window keeps the app running in the notification area (Windows).
+    pub close_to_tray: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -51,6 +55,7 @@ impl Default for Config {
             refresh_token: None,
             volume: 0.5,
             accent: "Amber".into(),
+            light_theme: false,
             fun_enabled: true,
             fun_autoplay: false,
             shuffle: false,
@@ -59,6 +64,7 @@ impl Default for Config {
             recent_searches: Vec::new(),
             resume_session: true,
             check_updates: true,
+            close_to_tray: false,
         }
     }
 }
