@@ -28,14 +28,20 @@ lite-spotify talks to Spotify through a free "developer app" that belongs to you
 
 ## 2. Download and run lite-spotify
 
-1. Open this repository on GitHub and click the **Actions** tab.
-2. Click the newest run of **Build** that has a green check mark.
-3. Scroll down to **Artifacts** and click **lite-spotify-windows**. A `.zip` file downloads.
-   (You need to be logged in to GitHub to download artifacts.)
-4. Unzip it. Inside is `lite-spotify.exe`. Put it anywhere you like, e.g. your Desktop.
-5. Double-click `lite-spotify.exe`.
+1. Open <https://github.com/havelayn/lite-spotify/releases>. (On the repository page,
+   you can also click **Releases** on the right-hand side.)
+2. The newest version is at the top. Under **Assets**, click
+   `lite-spotify-vX.Y.Z.exe` to download it. You don't need to unzip anything.
+3. Put the file anywhere you like, e.g. your Desktop, and double-click it.
    Windows may show "Windows protected your PC" because the app is not signed.
    Click **More info** and then **Run anyway**.
+
+**Older versions** stay on the Releases page forever. Scroll down to find them.
+All versions share the same settings and login, so you can switch back and forth.
+
+**Test builds:** every change also gets built in the **Actions** tab. Open a run with
+a green check mark and download **lite-spotify-windows** under **Artifacts**
+(you need to be logged in to GitHub). These test builds are deleted after 90 days.
 
 ## 3. First start
 
@@ -73,3 +79,8 @@ cargo build --release
 
 The program ends up in `target\release\lite-spotify.exe`. On Linux you also need the
 ALSA headers (`sudo apt install libasound2-dev`).
+
+## Credits
+
+The app uses the [Inter](https://rsms.me/inter/) font by Rasmus Andersson, under the
+SIL Open Font License (see `assets/fonts/Inter-LICENSE.txt`).

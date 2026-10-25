@@ -5,18 +5,21 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Key, Layout, RichText, Sense, TextureHandle, Vec2,
+    self, Align, Color32, CornerRadius, Frame, Key, Layout, Margin, Rect, RichText, Sense, Stroke,
+    TextureHandle, Ui, Vec2, pos2, vec2,
 };
 
 use crate::api::{self, Album, Playlist, SearchResults, Track, TrackSource, WebApi};
 use crate::auth;
 use crate::config::{self, Config};
 use crate::player::{PlayerCtl, PlayerMsg};
+use crate::theme::{self, BG, CARD, ERROR, GREEN, HOVER, MUTED, RAISED, SUBDUED, TEXT};
+use crate::widgets::{
+    self, Icon, PillStyle, TRACK_HEADER_HEIGHT, TRACK_ROW_HEIGHT, Tile, format_time,
+};
 
-const GREEN: Color32 = Color32::from_rgb(0x1d, 0xb9, 0x54);
-const DIM: Color32 = Color32::from_rgb(0xa7, 0xa7, 0xa7);
-const ROW_HEIGHT: f32 = 28.0;
-const ART_SIZE: f32 = 56.0;
+/// How long a message at the bottom of the window stays visible.
+const NOTICE_TIME: Duration = Duration::from_secs(6);
 
 /// Messages from background tasks to the UI thread.
 enum Msg {
@@ -137,7 +140,8 @@ pub struct App {
     view: View,
     next_view_id: u64,
     search_input: String,
-    notice: Option<String>,
+    /// A short message shown at the bottom of the window, and when it appeared.
+    notice: Option<(String, Instant)>,
 
     player: Option<PlayerCtl>,
     player_state: PlayerState,
@@ -151,11 +155,20 @@ pub struct App {
     cover_requested: Option<String>,
     /// The browser sign-in that is waiting for the user, so it can be cancelled.
     sign_in_task: Option<tokio::task::JoinHandle<()>>,
+    /// The list the queue was started from, to highlight it in the library.
+    playing_source: Option<TrackSource>,
+    volume_before_mute: f32,
+
+    liked_tile: TextureHandle,
+    /// Background fade at the top of the main area, and the colour it was made for.
+    header_fade: Option<(Color32, TextureHandle)>,
+    /// When the redirect URI was copied, to show "Copied" for a moment.
+    copied_at: Option<Instant>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Runtime) -> Self {
-        setup_style(&cc.egui_ctx);
+        theme::setup(&cc.egui_ctx);
         let (tx, rx) = channel();
         let outbox = Outbox {
             tx,
@@ -202,7 +215,22 @@ impl App {
             cover: None,
             cover_requested: None,
             sign_in_task: None,
+            playing_source: None,
+            volume_before_mute: 0.5,
+            liked_tile: widgets::gradient_texture(&cc.egui_ctx, "liked", [64, 64], |x, y| {
+                let a = Color32::from_rgb(0x45, 0x0a, 0xf5);
+                let b = Color32::from_rgb(0xc4, 0xef, 0xd9);
+                widgets::lerp_color(a, b, (x + y) / 2.0)
+            }),
+            header_fade: None,
+            copied_at: None,
         };
+
+        #[cfg(debug_assertions)]
+        if std::env::var_os("LITE_SPOTIFY_DEMO").is_some() {
+            app.fill_demo_data();
+            return app;
+        }
 
         if app.config.client_id.is_empty() {
             app.screen = Screen::Setup {
@@ -335,6 +363,7 @@ impl App {
         let _ = std::fs::remove_dir_all(config::player_credentials_dir());
         self.playlists.clear();
         self.queue.clear();
+        self.playing_source = None;
         self.now = NowPlaying::default();
         self.cover = None;
         self.user_name.clear();
@@ -343,6 +372,10 @@ impl App {
             busy: false,
             error: None,
         };
+    }
+
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notice = Some((message.into(), Instant::now()));
     }
 
     // ------------------------------------------------------------- browsing
@@ -420,7 +453,8 @@ impl App {
     // ------------------------------------------------------------- playback
 
     /// Plays `tracks[index]` and makes `tracks` the queue for next/previous.
-    fn play_list(&mut self, tracks: Vec<Track>, index: usize) {
+    fn play_list(&mut self, tracks: Vec<Track>, index: usize, source: Option<TrackSource>) {
+        self.playing_source = source;
         self.queue = tracks;
         self.skipped_in_a_row = 0;
         self.play_at(index, true);
@@ -433,7 +467,7 @@ impl App {
             return false;
         };
         if !matches!(self.player_state, PlayerState::Ready) {
-            self.notice = Some("The player is not connected yet. Please wait a moment.".into());
+            self.notify("The player is not connected yet. Please wait a moment.");
             return false;
         }
         let mut i = index;
@@ -570,9 +604,7 @@ impl App {
             PlayerMsg::Unavailable { uri } if is_current(&uri) => {
                 self.skipped_in_a_row += 1;
                 if self.skipped_in_a_row > 5 {
-                    self.notice = Some(
-                        "Several tracks in a row could not be played. Playback stopped.".into(),
-                    );
+                    self.notify("Several tracks in a row could not be played. Playback stopped.");
                     self.now.loading = false;
                 } else {
                     let name = self
@@ -581,7 +613,7 @@ impl App {
                         .as_ref()
                         .map(|t| t.name.clone())
                         .unwrap_or_default();
-                    self.notice = Some(format!("\"{name}\" is not available, skipped it."));
+                    self.notify(format!("\"{name}\" is not available, skipped it."));
                     self.next();
                 }
             }
@@ -614,7 +646,7 @@ impl App {
                     self.playlists_loading = false;
                     match result {
                         Ok(p) => self.playlists = p,
-                        Err(e) => self.notice = Some(format!("Could not load playlists: {e}")),
+                        Err(e) => self.notify(format!("Could not load playlists: {e}")),
                     }
                 }
                 Msg::TracksPage { view, tracks } if view == self.view.id => {
@@ -652,59 +684,135 @@ impl App {
 
     // ------------------------------------------------------------------ UI
 
-    fn setup_screen(&mut self, ui: &mut egui::Ui) {
+    /// A dark card in the middle of the window, used by the setup and sign-in screens.
+    fn centered_card(ui: &mut Ui, width: f32, add_contents: impl FnOnce(&mut Ui)) {
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(BG))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let width = width.min(ui.available_width() - 32.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() * 0.06).clamp(16.0, 80.0));
+                        Frame::new()
+                            .fill(CARD)
+                            .corner_radius(12)
+                            .inner_margin(32)
+                            .show(ui, |ui| {
+                                ui.set_width(width - 64.0);
+                                ui.with_layout(Layout::top_down(Align::Min), add_contents);
+                            });
+                        ui.add_space(24.0);
+                    });
+                });
+            });
+    }
+
+    fn setup_screen(&mut self, ui: &mut Ui) {
+        let copied = self
+            .copied_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+        if copied {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
         let Screen::Setup { input, error } = &mut self.screen else {
             return;
         };
         let mut submit = false;
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.heading(RichText::new("Welcome to lite-spotify").size(26.0));
-            });
-            ui.add_space(16.0);
-            ui.label("lite-spotify talks to Spotify through your own (free) Spotify developer app. One-time setup:");
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("1. Open");
-                ui.hyperlink("https://developer.spotify.com/dashboard");
-                ui.label("and log in with your Spotify account.");
-            });
-            ui.label("2. Click \"Create app\". Any name and description will do.");
-            ui.horizontal(|ui| {
-                ui.label("3. Under \"Redirect URIs\" add exactly:");
-                ui.code(auth::WEB_REDIRECT_URI);
-                if ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(auth::WEB_REDIRECT_URI.to_string());
-                }
-            });
-            ui.label("4. Tick \"Web API\", accept the terms and save.");
-            ui.label("5. Copy the app's \"Client ID\" and paste it here:");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let edit = ui.add(
-                    egui::TextEdit::singleline(input)
-                        .hint_text("Client ID (32 letters and numbers)")
-                        .desired_width(340.0),
-                );
-                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    submit = true;
-                }
-                if ui.button("Save and sign in").clicked() {
-                    submit = true;
-                }
-            });
-            if let Some(e) = error {
-                ui.colored_label(Color32::LIGHT_RED, e.as_str());
-            }
-            ui.add_space(12.0);
+        let mut copy = false;
+        Self::centered_card(ui, 600.0, |ui| {
+            widgets::logo(ui, 22.0);
+            ui.add_space(14.0);
             ui.label(
-                RichText::new(format!("Settings are saved in {}", config::app_dir().display()))
-                    .color(DIM)
-                    .small(),
+                RichText::new("Welcome to lite-spotify")
+                    .font(theme::bold(28.0))
+                    .color(TEXT),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "lite-spotify connects to Spotify through your own free developer app. \
+                     This takes about three minutes and only has to be done once.",
+                )
+                .color(SUBDUED),
+            );
+            ui.add_space(20.0);
+
+            step(ui, 1, |ui| {
+                ui.label("Open");
+                ui.hyperlink_to(
+                    "developer.spotify.com/dashboard",
+                    "https://developer.spotify.com/dashboard",
+                );
+                ui.label("and log in.");
+            });
+            step(ui, 2, |ui| {
+                ui.label("Click \"Create app\". Any name and description will do.");
+            });
+            step(ui, 3, |ui| {
+                ui.label("Under \"Redirect URIs\", add exactly this address:");
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(36.0);
+                Frame::new()
+                    .fill(RAISED)
+                    .corner_radius(6)
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(auth::WEB_REDIRECT_URI)
+                                .monospace()
+                                .color(TEXT),
+                        );
+                    });
+                let label = if copied { "Copied" } else { "Copy" };
+                if widgets::pill_button(ui, label, PillStyle::Outline, 13.0, false).clicked() {
+                    copy = true;
+                }
+            });
+            ui.add_space(4.0);
+            step(ui, 4, |ui| {
+                ui.label("Tick \"Web API\", accept the terms and click Save.");
+            });
+            step(ui, 5, |ui| {
+                ui.label("Open the app's Settings, copy the Client ID and paste it below.");
+            });
+            ui.add_space(12.0);
+
+            let edit = ui.add(
+                egui::TextEdit::singleline(input)
+                    .hint_text("Client ID")
+                    .font(theme::regular(16.0))
+                    .margin(vec2(14.0, 12.0))
+                    .desired_width(f32::INFINITY),
+            );
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = true;
+            }
+            if let Some(e) = error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e.as_str()).color(ERROR));
+            }
+            ui.add_space(16.0);
+            if widgets::pill_button(ui, "Save and sign in", PillStyle::Primary, 16.0, true)
+                .clicked()
+            {
+                submit = true;
+            }
+            ui.add_space(16.0);
+            ui.label(
+                RichText::new(format!(
+                    "Settings are saved in {}",
+                    config::app_dir().display()
+                ))
+                .color(MUTED)
+                .small(),
             );
         });
 
+        if copy {
+            ui.ctx().copy_text(auth::WEB_REDIRECT_URI.to_string());
+            self.copied_at = Some(Instant::now());
+        }
         if submit {
             let id = input.trim().to_string();
             if id.len() == 32 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -721,7 +829,7 @@ impl App {
         }
     }
 
-    fn sign_in_screen(&mut self, ui: &mut egui::Ui) {
+    fn sign_in_screen(&mut self, ui: &mut Ui) {
         let Screen::SignIn { url, busy, error } = &self.screen else {
             return;
         };
@@ -729,46 +837,60 @@ impl App {
         let mut sign_in = false;
         let mut change_id = false;
         let mut cancel = false;
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(60.0);
+        Self::centered_card(ui, 440.0, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading(RichText::new("lite-spotify").size(30.0).color(GREEN));
-                ui.add_space(20.0);
+                widgets::logo(ui, 32.0);
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new("lite-spotify")
+                        .font(theme::bold(32.0))
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new("A small player for your Spotify Premium account").color(SUBDUED),
+                );
+                ui.add_space(28.0);
                 if busy {
-                    ui.spinner();
-                    if url.is_some() {
-                        ui.label("Finish signing in in your browser, then come back here.");
-                    } else {
-                        ui.label("Signing in…");
-                    }
+                    ui.add(egui::Spinner::new().size(28.0).color(GREEN));
+                    ui.add_space(12.0);
                     if let Some(url) = &url {
-                        ui.add_space(8.0);
-                        ui.hyperlink_to("Browser did not open? Click here.", url);
+                        ui.label(RichText::new("Finish signing in in your browser,").color(TEXT));
+                        ui.label(RichText::new("then come back here.").color(TEXT));
                         ui.add_space(12.0);
-                        if ui.button("Cancel").clicked() {
+                        ui.hyperlink_to("Browser did not open? Click here.", url);
+                        ui.add_space(20.0);
+                        if widgets::pill_button(ui, "Cancel", PillStyle::Outline, 14.0, false)
+                            .clicked()
+                        {
                             cancel = true;
                         }
+                    } else {
+                        ui.label(RichText::new("Signing in…").color(TEXT));
                     }
                 } else {
                     if let Some(e) = &error {
-                        ui.colored_label(Color32::LIGHT_RED, e);
-                        ui.add_space(12.0);
+                        ui.label(RichText::new(e).color(ERROR));
+                        ui.add_space(16.0);
                     }
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("  Sign in with Spotify  ")
-                                    .size(18.0)
-                                    .color(Color32::BLACK),
-                            )
-                            .fill(GREEN),
-                        )
-                        .clicked()
+                    if widgets::pill_button(
+                        ui,
+                        "Sign in with Spotify",
+                        PillStyle::Primary,
+                        16.0,
+                        true,
+                    )
+                    .clicked()
                     {
                         sign_in = true;
                     }
-                    ui.add_space(20.0);
-                    if ui.small_button("Use a different Client ID").clicked() {
+                    ui.add_space(16.0);
+                    let other = ui.add(
+                        egui::Button::new(
+                            RichText::new("Use a different Client ID").color(SUBDUED),
+                        )
+                        .frame(false),
+                    );
+                    if other.clicked() {
                         change_id = true;
                     }
                 }
@@ -796,94 +918,261 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.search_input)
-                        .hint_text("🔍 Search songs, albums, playlists")
-                        .desired_width(320.0),
-                );
-                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if (enter || ui.button("Search").clicked()) && !self.search_input.trim().is_empty()
-                {
-                    let query = self.search_input.trim().to_string();
-                    self.open(ViewKind::Search {
-                        query,
-                        results: None,
-                    });
-                }
+    fn main_screen(&mut self, ui: &mut Ui) {
+        egui::Panel::top("top")
+            .exact_size(64.0)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(BG))
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("player")
+            .exact_size(84.0)
+            .show_separator_line(false)
+            .frame(
+                Frame::new()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(16, 10)),
+            )
+            .show(ui, |ui| self.player_bar(ui));
+        egui::Panel::left("library")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(220.0..=440.0)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(BG).inner_margin(Margin {
+                left: 8,
+                right: 0,
+                top: 0,
+                bottom: 0,
+            }))
+            .show(ui, |ui| self.library(ui));
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(BG).inner_margin(Margin {
+                left: 8,
+                right: 8,
+                top: 0,
+                bottom: 0,
+            }))
+            .show(ui, |ui| self.main_card(ui));
+        self.toast(ui.ctx());
+    }
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.menu_button("⚙", |ui| {
-                        if ui.button("Reload playlists").clicked() {
-                            self.reload_playlists();
-                        }
-                        if ui.button("Open settings folder").clicked() {
-                            let _ = open::that_detached(config::app_dir());
-                        }
-                        if ui.button("Sign out").clicked() {
-                            self.sign_out();
-                        }
-                    });
-                    if !self.user_name.is_empty() {
-                        ui.label(RichText::new(&self.user_name).color(DIM));
-                    }
-                });
-            });
-            if let Some(notice) = self.notice.clone() {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(0xff, 0xc8, 0x6b), notice);
-                    if ui.small_button("✖").clicked() {
-                        self.notice = None;
-                    }
+    fn top_bar(&mut self, ui: &mut Ui) {
+        let full = ui.max_rect();
+
+        // Left: logo and name.
+        let logo =
+            Rect::from_center_size(pos2(full.left() + 32.0, full.center().y), Vec2::splat(32.0));
+        widgets::paint_logo(ui.painter(), logo.center(), 16.0);
+        ui.painter().text(
+            pos2(logo.right() + 10.0, full.center().y),
+            egui::Align2::LEFT_CENTER,
+            "lite-spotify",
+            theme::bold(17.0),
+            TEXT,
+        );
+
+        // Middle: the search box.
+        let width = (full.width() * 0.4).clamp(260.0, 480.0);
+        let search = Rect::from_center_size(full.center(), vec2(width, 44.0));
+        if self.search_box(ui, search) {
+            let query = self.search_input.trim().to_string();
+            if !query.is_empty() {
+                self.open(ViewKind::Search {
+                    query,
+                    results: None,
                 });
             }
-            ui.add_space(4.0);
+        }
+
+        // Right: avatar with the menu.
+        let avatar = Rect::from_center_size(
+            pos2(full.right() - 36.0, full.center().y),
+            Vec2::splat(40.0),
+        );
+        let response = ui.interact(avatar, ui.scope_id().with("avatar"), Sense::click());
+        let p = ui.painter();
+        p.circle_filled(
+            avatar.center(),
+            20.0,
+            if response.hovered() { HOVER } else { RAISED },
+        );
+        p.circle_filled(avatar.center(), 14.0, Color32::from_rgb(0xf5, 0x73, 0x3a));
+        let initial = self
+            .user_name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default();
+        p.text(
+            avatar.center(),
+            egui::Align2::CENTER_CENTER,
+            initial,
+            theme::bold(14.0),
+            Color32::BLACK,
+        );
+        let response = response.on_hover_text(&self.user_name);
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(200.0);
+            if !self.user_name.is_empty() {
+                ui.label(
+                    RichText::new(&self.user_name)
+                        .font(theme::bold(14.0))
+                        .color(TEXT),
+                );
+                ui.separator();
+            }
+            if ui.button("Reload playlists").clicked() {
+                self.reload_playlists();
+            }
+            if ui.button("Open settings folder").clicked() {
+                let _ = open::that_detached(config::app_dir());
+            }
+            ui.separator();
+            if ui.button("Sign out").clicked() {
+                self.sign_out();
+            }
+            ui.separator();
+            ui.label(
+                RichText::new(concat!("lite-spotify ", env!("CARGO_PKG_VERSION")))
+                    .small()
+                    .color(MUTED),
+            );
         });
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let mut open: Option<ViewKind> = None;
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(220.0)
-            .size_range(160.0..=400.0)
+    /// The rounded search box. Returns true when the user presses Enter.
+    fn search_box(&mut self, ui: &mut Ui, rect: Rect) -> bool {
+        let id = egui::Id::unique("search");
+        let focused = ui.memory(|m| m.has_focus(id));
+        let background = ui.interact(rect, id.with("bg"), Sense::click());
+        if background.clicked() {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let fill = if focused || background.hovered() {
+            HOVER
+        } else {
+            RAISED
+        };
+        let stroke = if focused {
+            Stroke::new(1.5, TEXT)
+        } else {
+            Stroke::NONE
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(255),
+            fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let icon =
+            Rect::from_center_size(pos2(rect.left() + 24.0, rect.center().y), Vec2::splat(20.0));
+        widgets::paint_icon(
+            ui.painter(),
+            icon,
+            Icon::Search,
+            if focused { TEXT } else { SUBDUED },
+        );
+
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 44.0, rect.top()),
+            pos2(rect.right() - 44.0, rect.bottom()),
+        );
+        let mut submitted = false;
+        widgets::place(
+            ui,
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_input)
+                        .id(id)
+                        .frame(Frame::NONE)
+                        .font(theme::regular(15.0))
+                        .hint_text("What do you want to play?")
+                        .desired_width(f32::INFINITY),
+                );
+                submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            },
+        );
+        if !self.search_input.is_empty() {
+            let clear = Rect::from_center_size(
+                pos2(rect.right() - 24.0, rect.center().y),
+                Vec2::splat(24.0),
+            );
+            let response = widgets::place(ui, egui::UiBuilder::new().max_rect(clear), |ui| {
+                widgets::icon_button(ui, Icon::Close, 14.0, true)
+            });
+            if response.on_hover_text("Clear").clicked() {
+                self.search_input.clear();
+            }
+        }
+        submitted
+    }
+
+    fn library(&mut self, ui: &mut Ui) {
+        let mut open = None;
+        Frame::new()
+            .fill(CARD)
+            .corner_radius(8)
+            .inner_margin(Margin::same(8))
             .show(ui, |ui| {
-                ui.add_space(8.0);
-                let liked = matches!(&self.view.kind, ViewKind::Tracks(TrackSource::LikedSongs));
-                if ui
-                    .selectable_label(liked, RichText::new("❤ Liked Songs").strong())
-                    .clicked()
-                {
-                    open = Some(ViewKind::Tracks(TrackSource::LikedSongs));
-                }
-                ui.add_space(8.0);
+                ui.set_min_size(ui.available_size());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Playlists").color(DIM));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Your Library")
+                            .font(theme::bold(16.0))
+                            .color(TEXT),
+                    );
                     if self.playlists_loading {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
                     }
                 });
-                ui.separator();
+                ui.add_space(8.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let liked = TrackSource::LikedSongs;
+                        let selected =
+                            matches!(&self.view.kind, ViewKind::Tracks(s) if *s == liked);
+                        let playing = self.playing_source.as_ref() == Some(&liked);
+                        if widgets::library_row(
+                            ui,
+                            Tile::Liked(&self.liked_tile),
+                            "Liked Songs",
+                            "Playlist",
+                            selected,
+                            playing,
+                        )
+                        .clicked()
+                        {
+                            open = Some(ViewKind::Tracks(liked));
+                        }
                         for p in &self.playlists {
+                            let source = TrackSource::Playlist {
+                                id: p.id.clone(),
+                                name: p.name.clone(),
+                            };
                             let selected = matches!(&self.view.kind,
-                            ViewKind::Tracks(TrackSource::Playlist { id, .. }) if *id == p.id);
-                            let label = ui
-                                .add(egui::Button::selectable(selected, p.name.as_str()).truncate())
-                                .on_hover_text(format!(
-                                    "{} · by {} · {} tracks",
-                                    p.name, p.owner, p.total
-                                ));
-                            if label.clicked() {
-                                open = Some(ViewKind::Tracks(TrackSource::Playlist {
-                                    id: p.id.clone(),
-                                    name: p.name.clone(),
-                                }));
+                                ViewKind::Tracks(TrackSource::Playlist { id, .. }) if *id == p.id);
+                            let playing = matches!(&self.playing_source,
+                                Some(TrackSource::Playlist { id, .. }) if *id == p.id);
+                            let subtitle = format!("Playlist · {}", p.owner);
+                            if widgets::library_row(
+                                ui,
+                                Tile::Playlist,
+                                &p.name,
+                                &subtitle,
+                                selected,
+                                playing,
+                            )
+                            .on_hover_text(format!("{} · {} songs", p.name, p.total))
+                            .clicked()
+                            {
+                                open = Some(ViewKind::Tracks(source));
                             }
                         }
                     });
@@ -893,95 +1182,169 @@ impl App {
         }
     }
 
-    fn now_playing_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("now_playing")
-            .exact_size(ART_SIZE + 24.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(0x18, 0x18, 0x18))
-                    .inner_margin(12.0),
-            )
-            .show(ui, |ui| {
-                let width = ui.available_width();
-                let side = (width * 0.3).clamp(180.0, 360.0);
-                ui.horizontal_centered(|ui| {
-                    // Left: cover, title and artist.
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(side, ART_SIZE),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            match &self.cover {
-                                Some((_, tex)) if self.now.track.is_some() => {
-                                    ui.add(
-                                        egui::Image::new((tex.id(), Vec2::splat(ART_SIZE)))
-                                            .corner_radius(4.0),
-                                    );
-                                }
-                                _ => {
-                                    let (rect, _) = ui
-                                        .allocate_exact_size(Vec2::splat(ART_SIZE), Sense::hover());
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        CornerRadius::same(4),
-                                        Color32::from_gray(40),
-                                    );
-                                }
-                            }
-                            ui.vertical(|ui| {
-                                ui.set_width(ui.available_width());
-                                ui.add_space(8.0);
-                                if let Some(t) = &self.now.track {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&t.name).strong().color(Color32::WHITE),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&t.artists).color(DIM))
-                                            .truncate(),
-                                    );
-                                } else {
-                                    ui.label(RichText::new(self.player_status_text()).color(DIM));
-                                }
-                            });
-                        },
-                    );
+    fn player_bar(&mut self, ui: &mut Ui) {
+        let full = ui.max_rect();
+        let side = (full.width() * 0.3).clamp(200.0, 380.0);
+        let left = Rect::from_min_max(full.min, pos2(full.left() + side, full.bottom()));
+        let right = Rect::from_min_max(pos2(full.right() - side, full.top()), full.max);
+        let middle = Rect::from_min_max(
+            pos2(left.right() + 16.0, full.top()),
+            pos2(right.left() - 16.0, full.bottom()),
+        );
 
-                    // Middle: buttons and seek bar.
-                    let middle = (ui.available_width() - side).max(200.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(middle, ART_SIZE),
-                        Layout::top_down(Align::Center),
-                        |ui| {
-                            self.transport_controls(ui);
-                            self.seek_bar(ui);
-                        },
-                    );
+        // Left: cover, title and artist.
+        let cover =
+            Rect::from_min_size(pos2(left.left(), left.center().y - 28.0), Vec2::splat(56.0));
+        match (&self.cover, &self.now.track) {
+            (Some((_, texture)), Some(_)) => {
+                widgets::paint_tile(ui, cover, Tile::Cover(texture), 4)
+            }
+            (_, Some(_)) => widgets::paint_tile(ui, cover, Tile::Album, 4),
+            _ => {}
+        }
+        let text = Rect::from_min_max(
+            pos2(cover.right() + 14.0, cover.top() + 8.0),
+            pos2(left.right(), cover.bottom() - 6.0),
+        );
+        if let Some(t) = &self.now.track {
+            widgets::two_line_text(ui, text, &t.name, TEXT, &t.artists);
+        } else {
+            let status = self.player_status_text();
+            ui.painter().text(
+                pos2(left.left(), left.center().y),
+                egui::Align2::LEFT_CENTER,
+                status,
+                theme::regular(13.0),
+                SUBDUED,
+            );
+        }
 
-                    // Right: volume.
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().slider_width =
-                            (ui.available_width() - 40.0).clamp(60.0, 120.0);
-                        let response = ui.add(
-                            egui::Slider::new(&mut self.config.volume, 0.0..=1.0).show_value(false),
-                        );
-                        if response.changed()
-                            && let Some(p) = &self.player
-                        {
-                            p.set_volume(self.config.volume);
-                        }
-                        if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                            self.config.save();
-                        }
-                        ui.label(if self.config.volume == 0.0 {
-                            "🔇"
-                        } else {
-                            "🔊"
-                        });
-                    });
-                });
+        // Middle: buttons and the seek bar.
+        let ready = matches!(self.player_state, PlayerState::Ready);
+        let has_track = self.now.track.is_some();
+        let enabled = ready && has_track;
+        let buttons_y = middle.top() + 20.0;
+        let play_rect =
+            Rect::from_center_size(pos2(middle.center().x, buttons_y), Vec2::splat(34.0));
+        let prev_rect =
+            Rect::from_center_size(pos2(play_rect.left() - 32.0, buttons_y), Vec2::splat(28.0));
+        let next_rect =
+            Rect::from_center_size(pos2(play_rect.right() + 32.0, buttons_y), Vec2::splat(28.0));
+        let mut clicked = |rect: Rect, f: &mut dyn FnMut(&mut Ui) -> egui::Response| {
+            widgets::place(ui, egui::UiBuilder::new().max_rect(rect), |ui| {
+                f(ui).clicked()
+            })
+        };
+        if clicked(prev_rect, &mut |ui| {
+            widgets::icon_button(ui, Icon::Previous, 16.0, enabled).on_hover_text("Previous")
+        }) {
+            self.previous();
+        }
+        let playing = self.now.playing;
+        if clicked(play_rect, &mut |ui| {
+            widgets::play_button(ui, 34.0, playing, TEXT, enabled)
+                .on_hover_text("Play/pause (space)")
+        }) {
+            self.toggle_play();
+        }
+        if clicked(next_rect, &mut |ui| {
+            widgets::icon_button(ui, Icon::Next, 16.0, enabled).on_hover_text("Next")
+        }) {
+            self.next();
+        }
+
+        let duration_ms = self.now.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+        let shown_ms = self
+            .seek_drag
+            .map(|v| (v * duration_ms as f32) as u32)
+            .unwrap_or_else(|| self.now.position_ms());
+        let bar_y = middle.top() + 50.0;
+        let time_w = 44.0;
+        let bar_rect = Rect::from_min_max(
+            pos2(middle.left() + time_w + 8.0, bar_y - 8.0),
+            pos2(middle.right() - time_w - 8.0, bar_y + 8.0),
+        );
+        let time_font = theme::regular(12.0);
+        ui.painter().text(
+            pos2(bar_rect.left() - 8.0, bar_y),
+            egui::Align2::RIGHT_CENTER,
+            format_time(shown_ms),
+            time_font.clone(),
+            SUBDUED,
+        );
+        ui.painter().text(
+            pos2(bar_rect.right() + 8.0, bar_y),
+            egui::Align2::LEFT_CENTER,
+            format_time(duration_ms),
+            time_font,
+            SUBDUED,
+        );
+        let fraction = if duration_ms > 0 {
+            shown_ms as f32 / duration_ms as f32
+        } else {
+            0.0
+        };
+        let (response, new_value) =
+            widgets::place(ui, egui::UiBuilder::new().max_rect(bar_rect), |ui| {
+                widgets::thin_slider(ui, fraction, bar_rect.width(), enabled && duration_ms > 0)
             });
+        if let Some(v) = new_value {
+            self.seek_drag = Some(v);
+        }
+        // Seek once the user lets go of the bar.
+        if let Some(v) = self.seek_drag
+            && !response.is_pointer_button_down_on()
+            && !response.dragged()
+        {
+            self.seek_drag = None;
+            self.seek((v * duration_ms as f32) as u32);
+        }
+
+        // Right: volume.
+        let slider_w = 100.0_f32.min(right.width() - 48.0);
+        let vol_rect = Rect::from_min_max(
+            pos2(right.right() - slider_w, right.center().y - 8.0),
+            pos2(right.right(), right.center().y + 8.0),
+        );
+        let icon_rect = Rect::from_center_size(
+            pos2(vol_rect.left() - 20.0, right.center().y),
+            Vec2::splat(28.0),
+        );
+        let icon = match self.config.volume {
+            v if v <= 0.0 => Icon::VolumeOff,
+            v if v < 0.5 => Icon::VolumeLow,
+            _ => Icon::VolumeHigh,
+        };
+        let mute_clicked = widgets::place(ui, egui::UiBuilder::new().max_rect(icon_rect), |ui| {
+            widgets::icon_button(ui, icon, 16.0, true)
+                .on_hover_text("Mute")
+                .clicked()
+        });
+        let mut new_volume = None;
+        if mute_clicked {
+            if self.config.volume > 0.0 {
+                self.volume_before_mute = self.config.volume;
+                new_volume = Some(0.0);
+            } else {
+                new_volume = Some(self.volume_before_mute.max(0.1));
+            }
+        }
+        let (response, dragged_volume) =
+            widgets::place(ui, egui::UiBuilder::new().max_rect(vol_rect), |ui| {
+                widgets::thin_slider(ui, self.config.volume, slider_w, true)
+            });
+        if let Some(v) = dragged_volume {
+            new_volume = Some(v);
+        }
+        if let Some(v) = new_volume {
+            self.config.volume = v;
+            if let Some(p) = &self.player {
+                p.set_volume(v);
+            }
+        }
+        if mute_clicked || response.drag_stopped() || response.clicked() {
+            self.config.save();
+        }
     }
 
     fn player_status_text(&self) -> String {
@@ -990,224 +1353,489 @@ impl App {
             PlayerState::Connecting => "Connecting the player…".into(),
             PlayerState::BrowserLogin(_) => "Approve playback in your browser".into(),
             PlayerState::Ready => "Double-click a song to play it".into(),
-            PlayerState::Failed(_) => "Player is not connected".into(),
+            PlayerState::Failed(_) => "The player is not connected".into(),
         }
     }
 
-    fn transport_controls(&mut self, ui: &mut egui::Ui) {
-        let ready = matches!(self.player_state, PlayerState::Ready);
-        let has_track = self.now.track.is_some();
-        ui.horizontal(|ui| {
-            // Centre the three buttons in the available width.
-            let buttons_width = 3.0 * 36.0 + 2.0 * ui.spacing().item_spacing.x;
-            ui.add_space(((ui.available_width() - buttons_width) / 2.0).max(0.0));
-            let big = |s: &str| RichText::new(s).size(18.0);
-            if ui
-                .add_enabled(
-                    ready && has_track,
-                    egui::Button::new(big("⏮")).min_size(Vec2::new(36.0, 24.0)),
-                )
-                .on_hover_text("Previous")
-                .clicked()
-            {
-                self.previous();
-            }
-            let icon = if self.now.playing { "⏸" } else { "▶" };
-            if ui
-                .add_enabled(
-                    ready && has_track,
-                    egui::Button::new(big(icon)).min_size(Vec2::new(36.0, 24.0)),
-                )
-                .on_hover_text("Play/pause (space)")
-                .clicked()
-            {
-                self.toggle_play();
-            }
-            if ui
-                .add_enabled(
-                    ready && has_track,
-                    egui::Button::new(big("⏭")).min_size(Vec2::new(36.0, 24.0)),
-                )
-                .on_hover_text("Next")
-                .clicked()
-            {
-                self.next();
-            }
-        });
-    }
-
-    fn seek_bar(&mut self, ui: &mut egui::Ui) {
-        let duration_ms = self.now.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
-        ui.horizontal(|ui| {
-            let pos_ms = self.now.position_ms();
-            let shown_ms = self
-                .seek_drag
-                .map(|s| (s * 1000.0) as u32)
-                .unwrap_or(pos_ms);
-            let time_width = 44.0;
-            ui.add_sized(
-                [time_width, 16.0],
-                egui::Label::new(RichText::new(format_time(shown_ms)).small().color(DIM)),
-            );
-            ui.spacing_mut().slider_width = (ui.available_width() - time_width - 16.0).max(60.0);
-            let mut value = shown_ms as f32 / 1000.0;
-            let enabled = duration_ms > 0 && matches!(self.player_state, PlayerState::Ready);
-            let response = ui.add_enabled(
-                enabled,
-                egui::Slider::new(&mut value, 0.0..=(duration_ms as f32 / 1000.0).max(0.1))
-                    .show_value(false),
-            );
-            if response.changed() {
-                self.seek_drag = Some(value);
-            }
-            // Seek once the user lets go of the handle (or after a plain click).
-            if let Some(target) = self.seek_drag
-                && !response.dragged()
-            {
-                self.seek_drag = None;
-                self.seek((target * 1000.0) as u32);
-            }
-            ui.add_sized(
-                [time_width, 16.0],
-                egui::Label::new(RichText::new(format_time(duration_ms)).small().color(DIM)),
-            );
-        });
-    }
-
-    fn player_banner(&mut self, ui: &mut egui::Ui) {
+    /// Messages about the player that need the user's attention.
+    fn player_banner(&mut self, ui: &mut Ui) {
         let mut retry = false;
-        match &self.player_state {
-            PlayerState::BrowserLogin(url) => {
+        let (fill, text, link) = match &self.player_state {
+            PlayerState::BrowserLogin(url) => (
+                Color32::from_rgb(0x1e, 0x3a, 0x5f),
+                "One more step: a browser tab asks you to allow playback. \
+                 This is Spotify's own login for the audio player."
+                    .to_string(),
+                Some(url.clone()),
+            ),
+            PlayerState::Failed(e) => (
+                Color32::from_rgb(0x4a, 0x1c, 0x22),
+                format!("Player: {e}"),
+                None,
+            ),
+            _ => return,
+        };
+        Frame::new()
+            .fill(fill)
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(16, 12))
+            .outer_margin(Margin {
+                left: 8,
+                right: 8,
+                top: 8,
+                bottom: 0,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(GREEN, "One more step: a browser tab asks you to allow playback (this is Spotify's own player login).");
-                    ui.hyperlink_to("Open it again", url);
-                });
-            }
-            PlayerState::Failed(e) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(Color32::LIGHT_RED, format!("Player: {e}"));
-                    if ui.button("Retry").clicked() {
+                    ui.label(RichText::new(text).color(TEXT));
+                    if let Some(url) = &link {
+                        ui.hyperlink_to("Open it again", url);
+                    } else if widgets::pill_button(ui, "Retry", PillStyle::Outline, 13.0, false)
+                        .clicked()
+                    {
                         retry = true;
                     }
                 });
-            }
-            _ => {}
-        }
+            });
         if retry {
             self.start_player();
         }
     }
 
-    fn main_area(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
+    /// The fade at the top of the main card, made once per colour.
+    fn header_fade(&mut self, ctx: &egui::Context, color: Color32) -> TextureHandle {
+        if let Some((c, texture)) = &self.header_fade
+            && *c == color
+        {
+            return texture.clone();
+        }
+        let texture = widgets::gradient_texture(ctx, "header", [1, 64], |_, y| {
+            widgets::lerp_color(color, CARD, y.powf(0.8))
+        });
+        self.header_fade = Some((color, texture.clone()));
+        texture
+    }
+
+    fn main_card(&mut self, ui: &mut Ui) {
+        Frame::new().fill(CARD).corner_radius(8).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
             self.player_banner(ui);
-
-            let title = match &self.view.kind {
-                ViewKind::Tracks(TrackSource::LikedSongs) => "Liked Songs".to_string(),
-                ViewKind::Tracks(TrackSource::Playlist { name, .. }) => name.clone(),
-                ViewKind::Tracks(TrackSource::Album { name, .. }) => name.clone(),
-                ViewKind::Search { query, .. } => format!("Search: {query}"),
-            };
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new(title).size(22.0).strong());
-                if let ViewKind::Tracks(_) = self.view.kind {
-                    ui.label(RichText::new(format!("{} songs", self.view.tracks.len())).color(DIM));
-                }
-                if self.view.loading {
-                    ui.spinner();
-                }
-            });
-            if let Some(e) = &self.view.error {
-                ui.colored_label(Color32::LIGHT_RED, e);
-            }
-            ui.add_space(4.0);
-
             if matches!(self.view.kind, ViewKind::Search { .. }) {
-                self.search_results(ui);
+                self.search_view(ui);
             } else {
-                header_row(ui);
-                let current = self.now.track.as_ref().map(|t| t.uri.as_str());
-                let mut play = None;
-                // Rows sit directly below each other; the hover highlight separates them.
-                ui.spacing_mut().item_spacing.y = 0.0;
-                egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-                    ui,
-                    ROW_HEIGHT,
-                    self.view.tracks.len(),
-                    |ui, range| {
-                        for i in range {
-                            let t = &self.view.tracks[i];
-                            if track_row(ui, i + 1, t, current == Some(t.uri.as_str())) {
-                                play = Some(i);
-                            }
-                        }
-                    },
-                );
-                if let Some(i) = play {
-                    self.play_list(self.view.tracks.clone(), i);
-                }
+                self.tracks_view(ui);
             }
         });
     }
 
-    fn search_results(&mut self, ui: &mut egui::Ui) {
-        let ViewKind::Search {
-            results: Some(results),
-            ..
-        } = &self.view.kind
-        else {
+    fn tracks_view(&mut self, ui: &mut Ui) {
+        let ViewKind::Tracks(source) = &self.view.kind else {
             return;
         };
-        let current = self.now.track.as_ref().map(|t| t.uri.as_str());
+        let source = source.clone();
+        let (kind_label, title, color) = match &source {
+            TrackSource::LikedSongs => (
+                "Playlist",
+                "Liked Songs".to_string(),
+                theme::HEADER_COLORS[0],
+            ),
+            TrackSource::Playlist { id, name } => ("Playlist", name.clone(), color_for(id)),
+            TrackSource::Album { id, name } => ("Album", name.clone(), color_for(id)),
+        };
+        let owner = match &source {
+            TrackSource::Playlist { id, .. } => self
+                .playlists
+                .iter()
+                .find(|p| p.id == *id)
+                .map(|p| p.owner.clone()),
+            _ => None,
+        };
+        let count = self.view.tracks.len();
+        let mut details = match &owner {
+            Some(o) => format!("{o} · {count} songs"),
+            None => format!("{count} songs"),
+        };
+        if self.view.loading {
+            details.push_str(" · loading…");
+        }
+        let fade = self.header_fade(ui.ctx(), color);
+        let is_this_queue = self.playing_source.as_ref() == Some(&source);
+
+        const HEADER: f32 = 236.0;
+        const ACTIONS: f32 = 88.0;
+        let error_height = if self.view.error.is_some() { 40.0 } else { 0.0 };
+        let table_top = HEADER + ACTIONS + error_height;
+        let rows_top = table_top + TRACK_HEADER_HEIGHT + 8.0;
+        let total = rows_top + count as f32 * TRACK_ROW_HEIGHT + 24.0;
+
+        let mut play_index = None;
+        let mut header_play = false;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show_viewport(ui, |ui, viewport| {
+                ui.set_min_height(total);
+                let origin = ui.max_rect().min;
+                let width = ui.max_rect().width();
+                let at = |x: f32, y: f32| origin + vec2(x, y);
+
+                // Coloured fade behind the header.
+                let fade_rect = Rect::from_min_size(origin, vec2(width, HEADER + ACTIONS));
+                egui::Image::new((fade.id(), fade_rect.size()))
+                    .corner_radius(CornerRadius {
+                        nw: 8,
+                        ne: 8,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .paint_at(ui, fade_rect);
+
+                // Artwork and title.
+                let art = Rect::from_min_size(at(24.0, 52.0), Vec2::splat(160.0));
+                let tile = match &source {
+                    TrackSource::LikedSongs => Tile::Liked(&self.liked_tile),
+                    TrackSource::Playlist { .. } => Tile::Playlist,
+                    TrackSource::Album { .. } => Tile::Album,
+                };
+                widgets::paint_tile(ui, art, tile, 6);
+                let text_left = art.right() + 24.0;
+                let text_width = (origin.x + width - 24.0 - text_left).max(80.0);
+                let p = ui.painter();
+                p.text(
+                    pos2(text_left, art.top() + 52.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    kind_label,
+                    theme::bold(13.0),
+                    TEXT,
+                );
+                let title_size = fit_font_size(ui, &title, text_width, &[56.0, 44.0, 32.0, 24.0]);
+                let title_rect = Rect::from_min_size(
+                    pos2(text_left, art.top() + 56.0),
+                    vec2(text_width, title_size * 1.3),
+                );
+                widgets::place(ui, egui::UiBuilder::new().max_rect(title_rect), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&title)
+                                .font(theme::bold(title_size))
+                                .color(TEXT),
+                        )
+                        .truncate(),
+                    );
+                });
+                ui.painter().text(
+                    pos2(text_left, art.bottom() - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &details,
+                    theme::regular(14.0),
+                    TEXT,
+                );
+
+                // Big play button.
+                let play_rect = Rect::from_min_size(at(24.0, HEADER + 16.0), Vec2::splat(56.0));
+                let playing = is_this_queue && self.now.playing;
+                let can_play = matches!(self.player_state, PlayerState::Ready) && count > 0;
+                let response =
+                    widgets::place(ui, egui::UiBuilder::new().max_rect(play_rect), |ui| {
+                        widgets::play_button(ui, 56.0, playing, GREEN, can_play)
+                    });
+                if response.clicked() {
+                    header_play = true;
+                }
+                if self.view.loading {
+                    let spinner = Rect::from_center_size(
+                        play_rect.right_center() + vec2(32.0, 0.0),
+                        Vec2::splat(22.0),
+                    );
+                    ui.put(spinner, egui::Spinner::new().color(SUBDUED));
+                }
+
+                if let Some(e) = &self.view.error {
+                    let rect = Rect::from_min_size(
+                        at(24.0, HEADER + ACTIONS),
+                        vec2(width - 48.0, error_height),
+                    );
+                    widgets::place(ui, egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.label(RichText::new(e).color(ERROR));
+                    });
+                }
+
+                // The table.
+                let header_rect = Rect::from_min_size(
+                    at(16.0, table_top),
+                    vec2(width - 32.0, TRACK_HEADER_HEIGHT),
+                );
+                widgets::track_header(ui, header_rect);
+                let current = self.now.track.as_ref().map(|t| t.uri.as_str());
+                let first = ((viewport.min.y - rows_top) / TRACK_ROW_HEIGHT)
+                    .floor()
+                    .max(0.0) as usize;
+                let last = (((viewport.max.y - rows_top) / TRACK_ROW_HEIGHT)
+                    .ceil()
+                    .max(0.0) as usize)
+                    .min(count);
+                for i in first..last {
+                    let t = &self.view.tracks[i];
+                    let rect = Rect::from_min_size(
+                        at(16.0, rows_top + i as f32 * TRACK_ROW_HEIGHT),
+                        vec2(width - 32.0, TRACK_ROW_HEIGHT),
+                    );
+                    let is_current = current == Some(t.uri.as_str());
+                    if widgets::track_row(
+                        ui,
+                        rect,
+                        i + 1,
+                        t,
+                        is_current,
+                        is_current && self.now.playing,
+                    ) {
+                        play_index = Some(i);
+                    }
+                }
+            });
+
+        if header_play {
+            if is_this_queue && self.now.track.is_some() {
+                self.toggle_play();
+            } else {
+                self.play_list(self.view.tracks.clone(), 0, Some(source.clone()));
+            }
+        }
+        if let Some(i) = play_index {
+            self.play_list(self.view.tracks.clone(), i, Some(source));
+        }
+    }
+
+    fn search_view(&mut self, ui: &mut Ui) {
+        let fade = self.header_fade(ui.ctx(), theme::HEADER_COLORS[7]);
+        let ViewKind::Search { query, results } = &self.view.kind else {
+            return;
+        };
         let mut play = None;
         let mut open = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                ui.label(RichText::new("Songs").size(17.0).strong());
-                if results.tracks.is_empty() {
-                    ui.label(RichText::new("No songs found").color(DIM));
-                } else {
-                    header_row(ui);
-                }
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (i, t) in results.tracks.iter().enumerate() {
-                        if track_row(ui, i + 1, t, current == Some(t.uri.as_str())) {
-                            play = Some(i);
+                let top = ui.max_rect().min;
+                let width = ui.max_rect().width();
+                let fade_rect = Rect::from_min_size(top, vec2(width, 160.0));
+                egui::Image::new((fade.id(), fade_rect.size()))
+                    .corner_radius(CornerRadius {
+                        nw: 8,
+                        ne: 8,
+                        sw: 0,
+                        se: 0,
+                    })
+                    .paint_at(ui, fade_rect);
+
+                Frame::new()
+                    .inner_margin(Margin::symmetric(24, 24))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 48.0);
+                        ui.label(RichText::new("Search").font(theme::bold(13.0)).color(TEXT));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("\u{201c}{query}\u{201d}"))
+                                    .font(theme::bold(40.0))
+                                    .color(TEXT),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(16.0);
+                        if self.view.loading {
+                            ui.add(egui::Spinner::new().size(24.0).color(GREEN));
                         }
-                    }
-                });
-                ui.add_space(12.0);
-                ui.label(RichText::new("Albums").size(17.0).strong());
-                for a in &results.albums {
-                    if link_row(ui, &a.name, &a.artists) {
-                        open = Some(album_view(a));
-                    }
-                }
-                ui.add_space(12.0);
-                ui.label(RichText::new("Playlists").size(17.0).strong());
-                for p in &results.playlists {
-                    if link_row(ui, &p.name, &format!("by {}", p.owner)) {
-                        open = Some(ViewKind::Tracks(TrackSource::Playlist {
-                            id: p.id.clone(),
-                            name: p.name.clone(),
-                        }));
-                    }
-                }
+                        if let Some(e) = &self.view.error {
+                            ui.label(RichText::new(e).color(ERROR));
+                        }
+                        let Some(results) = results else { return };
+
+                        section_title(ui, "Songs");
+                        if results.tracks.is_empty() {
+                            ui.label(RichText::new("No songs found").color(SUBDUED));
+                        } else {
+                            let current = self.now.track.as_ref().map(|t| t.uri.as_str());
+                            let (rect, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), TRACK_HEADER_HEIGHT),
+                                Sense::hover(),
+                            );
+                            widgets::track_header(ui, rect);
+                            ui.add_space(8.0);
+                            for (i, t) in results.tracks.iter().enumerate() {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), TRACK_ROW_HEIGHT),
+                                    Sense::hover(),
+                                );
+                                let is_current = current == Some(t.uri.as_str());
+                                if widgets::track_row(
+                                    ui,
+                                    rect,
+                                    i + 1,
+                                    t,
+                                    is_current,
+                                    is_current && self.now.playing,
+                                ) {
+                                    play = Some(i);
+                                }
+                            }
+                        }
+
+                        ui.add_space(24.0);
+                        ui.columns(2, |cols| {
+                            section_title(&mut cols[0], "Albums");
+                            cols[0].spacing_mut().item_spacing.y = 0.0;
+                            if results.albums.is_empty() {
+                                cols[0].label(RichText::new("No albums found").color(SUBDUED));
+                            }
+                            for a in &results.albums {
+                                let subtitle = format!("Album · {}", a.artists);
+                                if widgets::library_row(
+                                    &mut cols[0],
+                                    Tile::Album,
+                                    &a.name,
+                                    &subtitle,
+                                    false,
+                                    false,
+                                )
+                                .clicked()
+                                {
+                                    open = Some(album_view(a));
+                                }
+                            }
+                            section_title(&mut cols[1], "Playlists");
+                            cols[1].spacing_mut().item_spacing.y = 0.0;
+                            if results.playlists.is_empty() {
+                                cols[1].label(RichText::new("No playlists found").color(SUBDUED));
+                            }
+                            for p in &results.playlists {
+                                let subtitle = format!("Playlist · {}", p.owner);
+                                if widgets::library_row(
+                                    &mut cols[1],
+                                    Tile::Playlist,
+                                    &p.name,
+                                    &subtitle,
+                                    false,
+                                    false,
+                                )
+                                .clicked()
+                                {
+                                    open = Some(ViewKind::Tracks(TrackSource::Playlist {
+                                        id: p.id.clone(),
+                                        name: p.name.clone(),
+                                    }));
+                                }
+                            }
+                        });
+                    });
             });
-        if let Some(i) = play {
-            let tracks = results.tracks.clone();
-            self.play_list(tracks, i);
+        if let Some(i) = play
+            && let ViewKind::Search {
+                results: Some(r), ..
+            } = &self.view.kind
+        {
+            let tracks = r.tracks.clone();
+            self.play_list(tracks, i, None);
         }
         if let Some(kind) = open {
             self.open(kind);
         }
     }
+
+    /// Short messages at the bottom of the window, like Spotify's blue toasts.
+    fn toast(&mut self, ctx: &egui::Context) {
+        let Some((text, since)) = &self.notice else {
+            return;
+        };
+        if since.elapsed() > NOTICE_TIME {
+            self.notice = None;
+            return;
+        }
+        ctx.request_repaint_after(NOTICE_TIME.saturating_sub(since.elapsed()));
+        let text = text.clone();
+        egui::Area::new(egui::Id::unique("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -100.0))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let response = Frame::new()
+                    .fill(Color32::from_rgb(0x2e, 0x77, 0xd0))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).color(TEXT));
+                    })
+                    .response;
+                if response.interact(Sense::click()).clicked() {
+                    self.notice = None;
+                }
+            });
+    }
+
+    /// Fake library for trying out the layout without a Spotify account
+    /// (debug builds only: set the LITE_SPOTIFY_DEMO environment variable).
+    #[cfg(debug_assertions)]
+    fn fill_demo_data(&mut self) {
+        self.screen = Screen::Main;
+        self.user_name = "Demo".into();
+        self.player_state = PlayerState::Ready;
+        self.playlists = (1..=24)
+            .map(|i| Playlist {
+                id: format!("demo{i}"),
+                name: format!("Playlist number {i} with a fairly long name"),
+                owner: "Demo".into(),
+                total: 20,
+            })
+            .collect();
+        let source = TrackSource::Playlist {
+            id: "demo2".into(),
+            name: "Playlist number 2 with a fairly long name".into(),
+        };
+        self.view.kind = ViewKind::Tracks(source.clone());
+        self.view.tracks = (0..120)
+            .map(|i| Track {
+                uri: format!("spotify:track:demo{i}"),
+                name: format!("Song title {i} \u{2014} 東京 Ünïcödé (Remastered 2011)"),
+                artists: "Artist One, Artist Two".into(),
+                album: "Some Album Name That Is Quite Long".into(),
+                duration_ms: 200_000 + i * 1000,
+                image_url: None,
+                playable: i % 9 != 4,
+            })
+            .collect();
+        self.playing_source = Some(source);
+        self.queue = self.view.tracks.clone();
+        self.queue_pos = 2;
+        self.now = NowPlaying {
+            track: Some(self.view.tracks[2].clone()),
+            playing: true,
+            loading: false,
+            position_ms: 65_000,
+            since: Some(Instant::now()),
+        };
+        self.notify("\"Song title 4\" is not available, skipped it.");
+
+        if std::env::var("LITE_SPOTIFY_DEMO").as_deref() == Ok("search") {
+            let results = SearchResults {
+                tracks: self.view.tracks[..6].to_vec(),
+                albums: (1..=5)
+                    .map(|i| Album {
+                        id: format!("album{i}"),
+                        name: format!("Album {i}"),
+                        artists: "Some Artist".into(),
+                    })
+                    .collect(),
+                playlists: self.playlists[..5].to_vec(),
+            };
+            self.view.kind = ViewKind::Search {
+                query: "demo search".into(),
+                results: Some(results),
+            };
+        }
+    }
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_messages(&ctx);
 
@@ -1222,10 +1850,7 @@ impl eframe::App for App {
                 {
                     self.toggle_play();
                 }
-                self.top_bar(ui);
-                self.now_playing_bar(ui);
-                self.sidebar(ui);
-                self.main_area(ui);
+                self.main_screen(ui);
                 // Keep the seek bar moving; otherwise only redraw when something happens.
                 if self.now.playing {
                     ctx.request_repaint_after(Duration::from_millis(500));
@@ -1239,6 +1864,51 @@ impl eframe::App for App {
     }
 }
 
+/// A numbered step on the setup screen.
+fn step(ui: &mut Ui, number: u32, add_contents: impl FnOnce(&mut Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 12.0, GREEN);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            number.to_string(),
+            theme::bold(13.0),
+            Color32::BLACK,
+        );
+        ui.add_space(4.0);
+        add_contents(ui);
+    });
+    ui.add_space(6.0);
+}
+
+fn section_title(ui: &mut Ui, text: &str) {
+    ui.add_space(8.0);
+    ui.label(RichText::new(text).font(theme::bold(22.0)).color(TEXT));
+    ui.add_space(8.0);
+}
+
+/// The biggest of `sizes` at which `text` fits in `width`.
+fn fit_font_size(ui: &Ui, text: &str, width: f32, sizes: &[f32]) -> f32 {
+    for &size in sizes {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.to_string(), theme::bold(size), TEXT);
+        if galley.size().x <= width {
+            return size;
+        }
+    }
+    sizes.last().copied().unwrap_or(24.0)
+}
+
+/// A steady colour per playlist or album, for the fade behind its header.
+fn color_for(id: &str) -> Color32 {
+    let hash = id
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    theme::HEADER_COLORS[1 + (hash as usize % 6)]
+}
+
 fn album_view(a: &Album) -> ViewKind {
     ViewKind::Tracks(TrackSource::Album {
         id: a.id.clone(),
@@ -1250,140 +1920,4 @@ fn is_forbidden(e: &anyhow::Error) -> bool {
     e.downcast_ref::<api::ApiError>().is_some_and(|e| {
         e.status == reqwest::StatusCode::FORBIDDEN || e.status == reqwest::StatusCode::NOT_FOUND
     })
-}
-
-fn format_time(ms: u32) -> String {
-    let s = ms / 1000;
-    format!("{}:{:02}", s / 60, s % 60)
-}
-
-/// x offsets and widths of the track list columns.
-fn columns(width: f32) -> [(f32, f32); 5] {
-    let num = 40.0;
-    let dur = 56.0;
-    let rest = (width - num - dur).max(100.0);
-    let title = rest * 0.42;
-    let artist = rest * 0.30;
-    let album = rest - title - artist;
-    [
-        (0.0, num),
-        (num, title),
-        (num + title, artist),
-        (num + title + artist, album),
-        (num + title + artist + album, dur),
-    ]
-}
-
-fn header_row(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), Sense::hover());
-    let cols = columns(rect.width());
-    let font = egui::FontId::proportional(12.0);
-    for ((x, _), text) in cols.iter().zip(["#", "Title", "Artist", "Album", "Time"]) {
-        ui.painter().text(
-            rect.left_center() + Vec2::new(x + 6.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            text,
-            font.clone(),
-            DIM,
-        );
-    }
-    ui.painter()
-        .hline(rect.x_range(), rect.bottom(), (1.0, Color32::from_gray(50)));
-}
-
-/// Draws one song row. Returns true when the user wants to play it.
-fn track_row(ui: &mut egui::Ui, number: usize, t: &Track, is_current: bool) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
-    let hovered = ui.rect_contains_pointer(rect);
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(4), Color32::from_gray(38));
-    }
-    let color = if !t.playable {
-        Color32::from_gray(90)
-    } else if is_current {
-        GREEN
-    } else {
-        Color32::from_gray(225)
-    };
-    let cols = columns(rect.width());
-    let number_text = if hovered && t.playable {
-        "▶".to_string()
-    } else {
-        number.to_string()
-    };
-    let texts = [
-        number_text,
-        t.name.clone(),
-        t.artists.clone(),
-        t.album.clone(),
-        format_time(t.duration_ms),
-    ];
-    for (i, ((x, w), text)) in cols.iter().zip(texts).enumerate() {
-        let cell = egui::Rect::from_min_size(
-            rect.min + Vec2::new(x + 6.0, 0.0),
-            Vec2::new(w - 10.0, ROW_HEIGHT),
-        );
-        let text_color = if i >= 2 && t.playable && !is_current {
-            DIM
-        } else {
-            color
-        };
-        let label = egui::Label::new(RichText::new(text).color(text_color))
-            .truncate()
-            .selectable(false);
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(cell)
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| ui.add(label),
-        );
-    }
-    if !t.playable {
-        response.on_hover_text("This song is not available");
-        return false;
-    }
-    let clicked_number = response.clicked()
-        && ui
-            .input(|i| i.pointer.interact_pos())
-            .is_some_and(|p| p.x < rect.left() + cols[1].0);
-    response.double_clicked() || clicked_number
-}
-
-/// A clickable line for an album or playlist in search results.
-fn link_row(ui: &mut egui::Ui, name: &str, detail: &str) -> bool {
-    ui.horizontal(|ui| {
-        let r = ui.add(
-            egui::Button::new(RichText::new(name).color(Color32::WHITE))
-                .frame(false)
-                .truncate(),
-        );
-        ui.label(RichText::new(detail).color(DIM));
-        r.clicked()
-    })
-    .inner
-}
-
-fn setup_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(0x12, 0x12, 0x12);
-    visuals.window_fill = Color32::from_rgb(0x1e, 0x1e, 0x1e);
-    visuals.extreme_bg_color = Color32::from_rgb(0x24, 0x24, 0x24);
-    visuals.selection.bg_fill = Color32::from_rgb(0x1d, 0x6b, 0x38);
-    visuals.hyperlink_color = GREEN;
-    visuals.slider_trailing_fill = true;
-    ctx.set_visuals_of(egui::Theme::Dark, visuals);
-    ctx.style_mut_of(egui::Theme::Dark, |style| {
-        style.interaction.selectable_labels = false;
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        for (text_style, font) in style.text_styles.iter_mut() {
-            font.size = match text_style {
-                egui::TextStyle::Small => 11.5,
-                egui::TextStyle::Heading => 20.0,
-                _ => 14.0,
-            };
-        }
-    });
 }
