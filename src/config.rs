@@ -23,6 +23,11 @@ pub struct Config {
     pub fun_autoplay: bool,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// When the queue runs out (or a single song was played), keep going with
+    /// similar songs from Spotify's radio.
+    pub autoplay_similar: bool,
+    /// The last few searches, newest first.
+    pub recent_searches: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -46,6 +51,8 @@ impl Default for Config {
             fun_autoplay: false,
             shuffle: false,
             repeat: Repeat::Off,
+            autoplay_similar: true,
+            recent_searches: Vec::new(),
         }
     }
 }

@@ -43,7 +43,16 @@ pub struct Playlist {
     pub id: String,
     pub name: String,
     pub owner: String,
+    /// Spotify user id of the owner, to know which playlists the user may change.
+    pub owner_id: String,
     pub total: u32,
+}
+
+/// Who is signed in.
+#[derive(Clone, Debug)]
+pub struct Me {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +159,32 @@ impl WebApi {
         path_or_url: &str,
         query: &[(&str, &str)],
     ) -> Result<T> {
+        let value = self
+            .request(reqwest::Method::GET, path_or_url, query, None)
+            .await?;
+        serde_json::from_value(value)
+            .with_context(|| format!("Unexpected answer from {path_or_url}"))
+    }
+
+    /// Sends a change (POST, PUT, DELETE) with a JSON body.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        self.request(method, path, &[], body).await
+    }
+
+    /// Makes a Web API request, refreshing the login and waiting out rate limits
+    /// as needed. Returns the JSON answer (`null` when there is none).
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path_or_url: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let url = if path_or_url.starts_with("https://") {
             path_or_url.to_string()
         } else {
@@ -158,16 +193,21 @@ impl WebApi {
         let mut force_refresh = false;
         for _attempt in 0..4 {
             let token = self.access_token(force_refresh).await?;
-            let response = self
+            let mut request = self
                 .http
-                .get(&url)
+                .request(method.clone(), &url)
                 .query(query)
-                .bearer_auth(token)
-                .send()
-                .await?;
+                .bearer_auth(token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await?;
             let status = response.status();
             if status.is_success() {
                 let body = response.bytes().await?;
+                if body.iter().all(u8::is_ascii_whitespace) {
+                    return Ok(Value::Null);
+                }
                 return serde_json::from_slice(&body)
                     .with_context(|| format!("Unexpected answer from {url}"));
             }
@@ -197,9 +237,76 @@ impl WebApi {
         Err(anyhow!("Spotify kept refusing the request to {url}"))
     }
 
-    pub async fn user_name(&self) -> Result<String> {
+    pub async fn me(&self) -> Result<Me> {
         let me: RawUser = self.get("/me", &[]).await?;
-        Ok(me.display_name.unwrap_or(me.id))
+        Ok(Me {
+            name: me.display_name.unwrap_or_else(|| me.id.clone()),
+            id: me.id,
+        })
+    }
+
+    /// Whether the login allows changing playlists (logins from before 0.4.0 don't).
+    pub async fn can_edit_playlists(&self) -> bool {
+        let tokens = self.tokens.lock().await;
+        auth::PLAYLIST_EDIT_SCOPES
+            .iter()
+            .all(|s| tokens.scope.split(' ').any(|g| g == *s))
+    }
+
+    /// Makes a new private playlist.
+    pub async fn create_playlist(&self, name: &str) -> Result<Playlist> {
+        let body = serde_json::json!({
+            "name": name,
+            "public": false,
+            "description": "Made with lite-spotify",
+        });
+        let value = self
+            .send(reqwest::Method::POST, "/me/playlists", Some(&body))
+            .await?;
+        let raw: RawPlaylist = serde_json::from_value(value).context("Unexpected answer")?;
+        Ok(raw.into_playlist())
+    }
+
+    /// Adds songs or episodes to the end of a playlist.
+    pub async fn add_to_playlist(&self, playlist_id: &str, uris: &[String]) -> Result<()> {
+        for chunk in uris.chunks(100) {
+            let body = serde_json::json!({ "uris": chunk });
+            self.send(
+                reqwest::Method::POST,
+                &format!("/playlists/{playlist_id}/items"),
+                Some(&body),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Removes every copy of a song from a playlist.
+    pub async fn remove_from_playlist(&self, playlist_id: &str, uri: &str) -> Result<()> {
+        let path = format!("/playlists/{playlist_id}/items");
+        // The body key was renamed from "tracks" to "items" with the 2026 endpoint
+        // rename; send the new name and fall back to the old one.
+        let body = serde_json::json!({ "items": [{ "uri": uri }] });
+        match self.send(reqwest::Method::DELETE, &path, Some(&body)).await {
+            Err(e) if is_status(&e, reqwest::StatusCode::BAD_REQUEST) => {
+                let body = serde_json::json!({ "tracks": [{ "uri": uri }] });
+                self.send(reqwest::Method::DELETE, &path, Some(&body))
+                    .await?;
+                Ok(())
+            }
+            other => other.map(|_| ()),
+        }
+    }
+
+    pub async fn rename_playlist(&self, playlist_id: &str, name: &str) -> Result<()> {
+        let body = serde_json::json!({ "name": name });
+        self.send(
+            reqwest::Method::PUT,
+            &format!("/playlists/{playlist_id}"),
+            Some(&body),
+        )
+        .await?;
+        Ok(())
     }
 
     /// All playlists the user owns or follows.
@@ -361,6 +468,12 @@ impl WebApi {
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.bytes().await?.to_vec())
     }
+}
+
+/// Whether `e` is a Web API error with this HTTP status.
+pub fn is_status(e: &anyhow::Error, status: reqwest::StatusCode) -> bool {
+    e.downcast_ref::<ApiError>()
+        .is_some_and(|e| e.status == status)
 }
 
 /// Parses each entry on its own and skips the ones that do not fit (Spotify
@@ -593,6 +706,11 @@ impl RawPlaylist {
         Playlist {
             id: self.id,
             name: self.name,
+            owner_id: self
+                .owner
+                .as_ref()
+                .map(|o| o.id.clone())
+                .unwrap_or_default(),
             owner: self
                 .owner
                 .map(|o| o.display_name.unwrap_or(o.id))

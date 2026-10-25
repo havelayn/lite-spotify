@@ -7,12 +7,12 @@ use eframe::egui::{
 };
 use rand::Rng;
 
-use super::{App, ListView, NOTICE_TIME, PlayerState, Screen, Tab};
-use crate::api::TrackSource;
+use super::{App, Dialog, ListView, NOTICE_TIME, PlayerState, Screen, Tab};
+use crate::api::{Track, TrackSource};
 use crate::auth;
 use crate::config::{self, Repeat};
 use crate::theme::{self, BG, BORDER, ERROR, HOVER, MUTED, RAISED, SUBDUED, SURFACE, TEXT};
-use crate::widgets::{self, ButtonStyle, Icon, format_time};
+use crate::widgets::{self, ButtonStyle, Icon, RowAction, RowMenu, format_time};
 
 /// What the user did in a song list.
 enum ListAction {
@@ -20,7 +20,29 @@ enum ListAction {
     Queue(usize),
     PlayAll,
     ShuffleAll,
+    AddTo(usize, String),
+    NewPlaylistWith(usize),
+    Remove(usize),
+    Rename,
 }
+
+/// Quick searches on the Search tab, for when you don't know what to look for.
+const SEARCH_IDEAS: [&str; 14] = [
+    "Chill",
+    "Workout",
+    "Focus",
+    "Party",
+    "Sleep",
+    "Lo-fi",
+    "Rock",
+    "Hip hop",
+    "Jazz",
+    "Acoustic",
+    "80s",
+    "90s",
+    "Summer",
+    "Road trip",
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
@@ -328,6 +350,7 @@ impl App {
                 }
             });
         self.toast(ui.ctx());
+        self.dialog_ui(ui.ctx());
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -354,9 +377,16 @@ impl App {
             for (tab, label) in tabs {
                 if tab_button(ui, label, self.tab == tab, bar.bottom()).clicked() {
                     self.tab = tab;
+                    if tab == Tab::Search {
+                        self.focus_search = true;
+                    }
                 }
             }
 
+            // The Search tab has its own big search box.
+            if self.tab == Tab::Search {
+                return;
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let width = (ui.available_width() - 8.0).clamp(140.0, 300.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
@@ -435,7 +465,7 @@ impl App {
         // Cover: smaller in short windows, so "Up next" keeps some room.
         let size = width
             .min(340.0)
-            .min((ui.available_height() - 330.0).max(120.0));
+            .min((ui.available_height() - 365.0).max(110.0));
         let (cover_rect, _) = ui.allocate_exact_size(vec2(width, size), Sense::hover());
         let cover_rect = Rect::from_center_size(cover_rect.center(), Vec2::splat(size));
         let icon = if self.now.track.as_ref().is_some_and(|t| t.is_episode) {
@@ -448,6 +478,7 @@ impl App {
         ui.add_space(12.0);
 
         // Title and artist.
+        let mut add_to: Option<Option<String>> = None;
         match &self.now.track {
             Some(t) => {
                 ui.add(
@@ -456,6 +487,27 @@ impl App {
                 );
                 ui.add(egui::Label::new(RichText::new(&t.artists).color(SUBDUED)).truncate());
                 ui.add(egui::Label::new(RichText::new(&t.album).small().color(MUTED)).truncate());
+                ui.add_space(4.0);
+                let button = widgets::button(ui, "+ Add to playlist", ButtonStyle::Ghost, 12.0);
+                let playlists = self.own_playlists();
+                egui::Popup::menu(&button).show(|ui| {
+                    ui.set_min_width(200.0);
+                    if ui.button("New playlist…").clicked() {
+                        add_to = Some(None);
+                    }
+                    if !playlists.is_empty() {
+                        ui.separator();
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for (id, name) in &playlists {
+                                if ui.button(name.as_str()).clicked() {
+                                    add_to = Some(Some(id.clone()));
+                                }
+                            }
+                        });
+                });
             }
             None => {
                 ui.label(
@@ -465,6 +517,19 @@ impl App {
                 );
                 ui.label(RichText::new(self.player_status_text()).color(SUBDUED));
                 ui.label(RichText::new(" ").small());
+            }
+        }
+        if let (Some(target), Some(track)) = (add_to, self.now.track.clone()) {
+            match target {
+                Some(id) => self.add_to_playlist(id, vec![track]),
+                None => {
+                    if self.check_can_edit() {
+                        self.dialog = Some(Dialog::NewPlaylist {
+                            name: String::new(),
+                            tracks: vec![track],
+                        });
+                    }
+                }
             }
         }
         ui.add_space(8.0);
@@ -744,12 +809,16 @@ impl App {
     fn library_tab(&mut self, ui: &mut Ui) {
         let mut open = None;
         let mut reload = false;
+        let mut new_playlist = false;
         Self::side_list(ui, "library-list", |ui| {
             let liked = TrackSource::LikedSongs;
             let selected = self.library.source.as_ref() == Some(&liked);
             let playing = self.playing_source.as_ref() == Some(&liked);
             if widgets::nav_row(ui, Icon::Heart, "Liked Songs", selected, playing).clicked() {
                 open = Some(liked);
+            }
+            if widgets::nav_row(ui, Icon::Plus, "New playlist", false, false).clicked() {
+                new_playlist = true;
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -798,6 +867,12 @@ impl App {
             });
         if reload {
             self.reload_playlists();
+        }
+        if new_playlist && self.check_can_edit() {
+            self.dialog = Some(Dialog::NewPlaylist {
+                name: String::new(),
+                tracks: Vec::new(),
+            });
         }
         if let Some(source) = open {
             self.open_list(source);
@@ -894,6 +969,35 @@ impl App {
         }
     }
 
+    /// The menu for song rows: the user's playlists, and "Remove" when `source`
+    /// is a playlist of their own.
+    fn row_menu(&self, source: Option<&TrackSource>) -> RowMenu {
+        let playlists = self.own_playlists();
+        let can_remove = matches!(source, Some(TrackSource::Playlist { id, .. })
+            if playlists.iter().any(|(own, _)| own == id));
+        RowMenu {
+            playlists,
+            can_remove,
+        }
+    }
+
+    /// Turns what happened in a song row into a list action.
+    fn row_to_action(row: RowAction, i: usize) -> Option<ListAction> {
+        if row.play {
+            Some(ListAction::Play(i))
+        } else if row.queue {
+            Some(ListAction::Queue(i))
+        } else if let Some(id) = row.add_to {
+            Some(ListAction::AddTo(i, id))
+        } else if row.new_playlist {
+            Some(ListAction::NewPlaylistWith(i))
+        } else if row.remove {
+            Some(ListAction::Remove(i))
+        } else {
+            None
+        }
+    }
+
     /// A list's title, buttons and song table.
     fn list_view(&self, ui: &mut Ui, which: Which) -> Option<ListAction> {
         let view = self.view(which);
@@ -915,32 +1019,27 @@ impl App {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let menu = self.row_menu(Some(source));
         let noun = if episodes { "episodes" } else { "songs" };
         let mut action = None;
 
+        ui.label(
+            RichText::new(kind.to_uppercase())
+                .font(theme::bold(11.0))
+                .color(theme::accent()),
+        );
+        ui.add(
+            egui::Label::new(RichText::new(&title).font(theme::bold(26.0)).color(TEXT)).truncate(),
+        );
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(kind.to_uppercase())
-                        .font(theme::bold(11.0))
-                        .color(theme::accent()),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(&title).font(theme::bold(26.0)).color(TEXT))
-                        .truncate(),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{count} {noun}{owner}")).color(SUBDUED));
-                    if view.loading {
-                        ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
-                    }
-                });
-            });
+            ui.label(RichText::new(format!("{count} {noun}{owner}")).color(SUBDUED));
+            if view.loading {
+                ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
+            }
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let enabled = count > 0;
-            ui.add_enabled_ui(enabled, |ui| {
+            ui.add_enabled_ui(count > 0, |ui| {
                 if widgets::button(ui, "Play", ButtonStyle::Accent, 14.0).clicked() {
                     action = Some(ListAction::PlayAll);
                 }
@@ -950,9 +1049,13 @@ impl App {
                     action = Some(ListAction::ShuffleAll);
                 }
             });
+            if menu.can_remove && widgets::button(ui, "Rename", ButtonStyle::Ghost, 14.0).clicked()
+            {
+                action = Some(ListAction::Rename);
+            }
             ui.add(
                 egui::Label::new(
-                    RichText::new("Double-click to play · right-click to add to the queue")
+                    RichText::new("Double-click to play · right-click for more")
                         .small()
                         .color(MUTED),
                 )
@@ -961,6 +1064,13 @@ impl App {
         });
         if let Some(e) = &view.error {
             ui.label(RichText::new(e).color(ERROR));
+        }
+        if menu.can_remove && count == 0 && !view.loading {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("This playlist is empty. Right-click any song in the app and choose \"Add to playlist\".")
+                    .color(SUBDUED),
+            );
         }
         ui.add_space(8.0);
 
@@ -996,12 +1106,10 @@ impl App {
                         t,
                         is_current,
                         is_current && self.now.playing,
+                        &menu,
                     );
-                    if row.play {
-                        action = Some(ListAction::Play(i));
-                    }
-                    if row.queue {
-                        action = Some(ListAction::Queue(i));
+                    if let Some(a) = Self::row_to_action(row, i) {
+                        action = Some(a);
                     }
                 }
             },
@@ -1009,10 +1117,13 @@ impl App {
         action
     }
 
-    fn apply_list_action(&mut self, which: Which, action: ListAction) {
-        let view = self.view(which);
-        let tracks = view.tracks.clone();
-        let source = view.source.clone();
+    /// Carries out `action` on `tracks` (the songs of the list it came from).
+    fn apply_action(
+        &mut self,
+        tracks: Vec<Track>,
+        source: Option<TrackSource>,
+        action: ListAction,
+    ) {
         match action {
             ListAction::Play(i) => self.play_list(tracks, i, source),
             ListAction::Queue(i) => self.add_to_queue(vec![tracks[i].clone()]),
@@ -1025,13 +1136,43 @@ impl App {
                 let start = rand::rng().random_range(0..tracks.len().max(1));
                 self.play_list(tracks, start, source);
             }
+            ListAction::AddTo(i, id) => self.add_to_playlist(id, vec![tracks[i].clone()]),
+            ListAction::NewPlaylistWith(i) => {
+                if self.check_can_edit() {
+                    self.dialog = Some(Dialog::NewPlaylist {
+                        name: String::new(),
+                        tracks: vec![tracks[i].clone()],
+                    });
+                }
+            }
+            ListAction::Remove(i) => {
+                if let Some(TrackSource::Playlist { id, .. }) = source {
+                    self.remove_from_playlist(id, tracks[i].clone());
+                }
+            }
+            ListAction::Rename => {
+                if let Some(TrackSource::Playlist { id, name }) = source
+                    && self.check_can_edit()
+                {
+                    self.dialog = Some(Dialog::Rename { id, name });
+                }
+            }
         }
     }
 
+    fn apply_list_action(&mut self, which: Which, action: ListAction) {
+        let view = self.view(which);
+        let tracks = view.tracks.clone();
+        let source = view.source.clone();
+        self.apply_action(tracks, source, action);
+    }
+
+    /// The Search tab: a big search box, then recent searches and ideas, or the results.
     fn search_tab(&mut self, ui: &mut Ui) {
-        let mut play = None;
-        let mut queue = None;
+        let mut action = None;
         let mut open = None;
+        let mut search_for: Option<String> = None;
+        let menu = self.row_menu(None);
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
@@ -1039,34 +1180,55 @@ impl App {
                     .inner_margin(Margin::symmetric(20, 14)),
             )
             .show(ui, |ui| {
+                // The big search box.
+                let width = ui.available_width().min(640.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(width, 48.0), Sense::hover());
+                if self.big_search_box(ui, rect) {
+                    search_for = Some(self.search_input.clone());
+                }
+                ui.add_space(14.0);
+
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
                         if self.search.query.is_empty() {
-                            ui.add_space(30.0);
-                            ui.label(RichText::new("Search").font(theme::bold(26.0)).color(TEXT));
-                            ui.label(
-                                RichText::new("Type in the box at the top right and press Enter.")
-                                    .color(SUBDUED),
-                            );
+                            if !self.config.recent_searches.is_empty() {
+                                section_title(ui, "Recent searches");
+                                ui.horizontal_wrapped(|ui| {
+                                    for q in &self.config.recent_searches {
+                                        if widgets::button(ui, q, ButtonStyle::Ghost, 13.0)
+                                            .clicked()
+                                        {
+                                            search_for = Some(q.clone());
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+                            section_title(ui, "Not sure? Try one of these");
+                            ui.horizontal_wrapped(|ui| {
+                                for idea in SEARCH_IDEAS {
+                                    if mood_chip(ui, idea).clicked() {
+                                        search_for = Some(idea.to_string());
+                                    }
+                                }
+                            });
                             return;
                         }
-                        ui.label(
-                            RichText::new("RESULTS FOR")
-                                .font(theme::bold(11.0))
-                                .color(theme::accent()),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&self.search.query)
-                                    .font(theme::bold(26.0))
-                                    .color(TEXT),
-                            )
-                            .truncate(),
-                        );
-                        if self.search.loading {
-                            ui.add(egui::Spinner::new().size(22.0).color(theme::accent()));
-                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Results for \u{201c}{}\u{201d}",
+                                    self.search.query
+                                ))
+                                .font(theme::bold(20.0))
+                                .color(TEXT),
+                            );
+                            if self.search.loading {
+                                ui.add(egui::Spinner::new().size(18.0).color(theme::accent()));
+                            }
+                        });
                         if let Some(e) = &self.search.error {
                             ui.label(RichText::new(e).color(ERROR));
                         }
@@ -1100,12 +1262,10 @@ impl App {
                                         t,
                                         is_current,
                                         is_current && self.now.playing,
+                                        &menu,
                                     );
-                                    if row.play {
-                                        play = Some(i);
-                                    }
-                                    if row.queue {
-                                        queue = Some(i);
+                                    if let Some(a) = Self::row_to_action(row, i) {
+                                        action = Some(a);
                                     }
                                 }
                             });
@@ -1165,21 +1325,82 @@ impl App {
                         });
                     });
             });
-        let tracks = self
-            .search
-            .results
-            .as_ref()
-            .map(|r| r.tracks.clone())
-            .unwrap_or_default();
-        if let Some(i) = play {
-            self.play_list(tracks.clone(), i, None);
+        if let Some(query) = search_for {
+            self.search_input = query;
+            self.start_search();
         }
-        if let Some(i) = queue {
-            self.add_to_queue(vec![tracks[i].clone()]);
+        if let Some(action) = action {
+            let tracks = self
+                .search
+                .results
+                .as_ref()
+                .map(|r| r.tracks.clone())
+                .unwrap_or_default();
+            self.apply_action(tracks, None, action);
         }
         if let Some(source) = open {
             self.open_list(source);
         }
+    }
+
+    /// The large search box on the Search tab. Returns true when the user presses Enter.
+    fn big_search_box(&mut self, ui: &mut Ui, rect: Rect) -> bool {
+        let id = egui::Id::unique("big-search");
+        if std::mem::take(&mut self.focus_search) {
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+        let focused = ui.memory(|m| m.has_focus(id));
+        let stroke = if focused {
+            Stroke::new(2.0, theme::accent())
+        } else {
+            Stroke::new(1.0, BORDER)
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(10),
+            RAISED,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        let icon =
+            Rect::from_center_size(pos2(rect.left() + 26.0, rect.center().y), Vec2::splat(20.0));
+        widgets::paint_icon(
+            ui.painter(),
+            icon,
+            Icon::Search,
+            if focused { TEXT } else { SUBDUED },
+        );
+        let text_rect = Rect::from_min_max(
+            pos2(rect.left() + 48.0, rect.top()),
+            pos2(rect.right() - 110.0, rect.bottom()),
+        );
+        let mut submitted = widgets::place_in(ui, text_rect, |ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.search_input)
+                    .id(id)
+                    .frame(Frame::NONE)
+                    .font(theme::regular(17.0))
+                    .hint_text("Songs, artists, albums, playlists, podcasts…")
+                    .desired_width(f32::INFINITY),
+            );
+            edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+        });
+        let button = Rect::from_min_max(
+            pos2(rect.right() - 100.0, rect.top() + 8.0),
+            pos2(rect.right() - 8.0, rect.bottom() - 8.0),
+        );
+        let clicked = widgets::place_in(ui, button, |ui| {
+            widgets::button_sized(
+                ui,
+                "Search",
+                ButtonStyle::Accent,
+                14.0,
+                Some(button.width()),
+            )
+            .clicked()
+        });
+        submitted |= clicked;
+        submitted && !self.search_input.trim().is_empty()
     }
 
     fn fun_tab(&mut self, ui: &mut Ui) {
@@ -1212,6 +1433,7 @@ impl App {
         let mut change_id = false;
         let mut reload = false;
         let mut retry = false;
+        let mut relogin = false;
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(20, 14)))
             .show(ui, |ui| {
@@ -1294,6 +1516,24 @@ impl App {
                                 .small()
                                 .color(MUTED),
                         );
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(
+                                &mut self.config.autoplay_similar,
+                                "Keep playing similar songs when the music runs out",
+                            )
+                            .changed()
+                        {
+                            self.config.save();
+                        }
+                        ui.label(
+                            RichText::new(
+                                "After a single song, or at the end of a list, lite-spotify adds songs \
+                                 in the same style from Spotify's radio and shuffles them.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
                     });
 
                     settings_card(ui, "Account", |ui| {
@@ -1303,6 +1543,18 @@ impl App {
                             format!("Signed in as {}", self.user_name)
                         };
                         ui.label(RichText::new(who).color(TEXT));
+                        if !self.can_edit_playlists && !self.user_id.is_empty() {
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("To make and change playlists, sign in once more.")
+                                        .color(SUBDUED),
+                                );
+                                if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 13.0).clicked() {
+                                    relogin = true;
+                                }
+                            });
+                        }
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             if widgets::button(ui, "Reload playlists", ButtonStyle::Ghost, 13.0).clicked() {
@@ -1351,6 +1603,9 @@ impl App {
         if retry {
             self.start_player();
         }
+        if relogin {
+            self.start_browser_sign_in();
+        }
         if reload {
             self.reload_playlists();
             if self.shows_loaded {
@@ -1365,6 +1620,111 @@ impl App {
                 input: self.config.client_id.clone(),
                 error: None,
             };
+        }
+    }
+
+    /// The dialog on top of the window: name a new playlist, rename one, or
+    /// ask to sign in again.
+    fn dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.dialog else {
+            return;
+        };
+        let (title, subtitle) = match dialog {
+            Dialog::NewPlaylist { tracks, .. } => (
+                "New playlist",
+                match tracks.as_slice() {
+                    [] => None,
+                    [one] => Some(format!("With \"{}\"", one.name)),
+                    many => Some(format!("With {} songs", many.len())),
+                },
+            ),
+            Dialog::Rename { .. } => ("Rename playlist", None),
+            Dialog::NeedsLogin => ("One more permission", None),
+        };
+        let renaming = matches!(dialog, Dialog::Rename { .. });
+        let mut submit: Option<String> = None;
+        let mut sign_in = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("dialog"))
+            .frame(
+                Frame::new()
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(12)
+                    .inner_margin(Margin::same(22)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new(title).font(theme::bold(20.0)).color(TEXT));
+                if let Some(subtitle) = subtitle {
+                    ui.add(egui::Label::new(RichText::new(subtitle).color(SUBDUED)).truncate());
+                }
+                ui.add_space(10.0);
+                match dialog {
+                    Dialog::NewPlaylist { name, .. } | Dialog::Rename { name, .. } => {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(name)
+                                .hint_text("Playlist name")
+                                .font(theme::regular(16.0))
+                                .margin(vec2(12.0, 10.0))
+                                .desired_width(f32::INFINITY),
+                        );
+                        if !edit.has_focus() && !edit.lost_focus() {
+                            edit.request_focus();
+                        }
+                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(14.0);
+                        let ok = !name.trim().is_empty();
+                        ui.horizontal(|ui| {
+                            let label = if renaming { "Rename" } else { "Create" };
+                            let clicked = ui
+                                .add_enabled_ui(ok, |ui| {
+                                    widgets::button(ui, label, ButtonStyle::Accent, 14.0)
+                                })
+                                .inner
+                                .clicked();
+                            if (clicked || enter) && ok {
+                                submit = Some(name.trim().to_string());
+                            }
+                            if widgets::button(ui, "Cancel", ButtonStyle::Ghost, 14.0).clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    Dialog::NeedsLogin => {
+                        ui.label(
+                            RichText::new(
+                                "To make and change playlists, lite-spotify needs one more permission \
+                                 from Spotify. Sign in again; it only takes a moment.",
+                            )
+                            .color(SUBDUED),
+                        );
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 14.0).clicked() {
+                                sign_in = true;
+                            }
+                            if widgets::button(ui, "Not now", ButtonStyle::Ghost, 14.0).clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                }
+            });
+        if modal.should_close() {
+            close = true;
+        }
+        if let Some(name) = submit {
+            match self.dialog.take() {
+                Some(Dialog::NewPlaylist { tracks, .. }) => self.create_playlist(name, tracks),
+                Some(Dialog::Rename { id, .. }) => self.rename_playlist(id, name),
+                _ => {}
+            }
+        } else if sign_in {
+            self.dialog = None;
+            self.start_browser_sign_in();
+        } else if close {
+            self.dialog = None;
         }
     }
 
@@ -1442,6 +1802,38 @@ fn step(ui: &mut Ui, number: u32, add_contents: impl FnOnce(&mut Ui)) {
         add_contents(ui);
     });
     ui.add_space(6.0);
+}
+
+/// A coloured tile for a quick search.
+fn mood_chip(ui: &mut Ui, text: &str) -> egui::Response {
+    const COLORS: [Color32; 7] = [
+        Color32::from_rgb(0x8c, 0x3b, 0x5e),
+        Color32::from_rgb(0x2d, 0x5d, 0x8a),
+        Color32::from_rgb(0x2f, 0x6e, 0x55),
+        Color32::from_rgb(0x8a, 0x5a, 0x2b),
+        Color32::from_rgb(0x5b, 0x46, 0x8f),
+        Color32::from_rgb(0x8a, 0x35, 0x35),
+        Color32::from_rgb(0x2e, 0x6f, 0x77),
+    ];
+    let hash = text
+        .bytes()
+        .fold(3usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+    let color = COLORS[hash % COLORS.len()];
+    let (rect, response) = ui.allocate_exact_size(vec2(150.0, 64.0), Sense::click());
+    let fill = if response.hovered() {
+        color.gamma_multiply(1.25)
+    } else {
+        color
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
+    ui.painter().text(
+        rect.left_top() + vec2(14.0, 12.0),
+        egui::Align2::LEFT_TOP,
+        text,
+        theme::bold(16.0),
+        TEXT,
+    );
+    response
 }
 
 fn section_title(ui: &mut Ui, text: &str) {

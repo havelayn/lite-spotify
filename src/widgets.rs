@@ -457,11 +457,25 @@ pub fn table_header(ui: &Ui, rect: Rect, labels: [&str; 2]) {
     );
 }
 
+/// What the right-click menu of a song row offers besides Play and Add to queue.
+#[derive(Default)]
+pub struct RowMenu {
+    /// The user's own playlists (id, name), for "Add to playlist".
+    pub playlists: Vec<(String, String)>,
+    /// Show "Remove from this playlist".
+    pub can_remove: bool,
+}
+
 /// What the user did with a row.
 #[derive(Default)]
 pub struct RowAction {
     pub play: bool,
     pub queue: bool,
+    /// Add the song to this playlist.
+    pub add_to: Option<String>,
+    /// Make a new playlist with the song.
+    pub new_playlist: bool,
+    pub remove: bool,
 }
 
 /// One song row: double-click (or click the number) to play, right-click for a menu.
@@ -472,6 +486,7 @@ pub fn table_row(
     t: &Track,
     is_current: bool,
     is_playing: bool,
+    menu: &RowMenu,
 ) -> RowAction {
     let response = ui.interact(rect, ui.scope_id().with(("row", number)), Sense::click());
     let hovered = response.hovered();
@@ -551,8 +566,44 @@ pub fn table_row(
         if ui.button("Add to queue").clicked() {
             action.queue = true;
         }
+        if let Some(target) = playlist_menu(ui, &menu.playlists) {
+            match target {
+                Some(id) => action.add_to = Some(id),
+                None => action.new_playlist = true,
+            }
+        }
+        if menu.can_remove {
+            ui.separator();
+            if ui.button("Remove from this playlist").clicked() {
+                action.remove = true;
+            }
+        }
     });
     action
+}
+
+/// An "Add to playlist" submenu. Returns `Some(Some(id))` for a playlist and
+/// `Some(None)` for "New playlist…".
+pub fn playlist_menu(ui: &mut Ui, playlists: &[(String, String)]) -> Option<Option<String>> {
+    let mut picked = None;
+    ui.menu_button("Add to playlist", |ui| {
+        if ui.button("New playlist…").clicked() {
+            picked = Some(None);
+        }
+        if !playlists.is_empty() {
+            ui.separator();
+        }
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .show(ui, |ui| {
+                for (id, name) in playlists {
+                    if ui.button(name.as_str()).clicked() {
+                        picked = Some(Some(id.clone()));
+                    }
+                }
+            });
+    });
+    picked
 }
 
 pub fn format_time(ms: u32) -> String {

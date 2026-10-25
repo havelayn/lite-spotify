@@ -26,7 +26,7 @@ enum Msg {
     SignedIn(Arc<WebApi>, Option<String>),
     SignInFailed(String),
     NewRefreshToken(String),
-    UserName(String),
+    Me(api::Me, bool),
     Playlists(Result<Vec<Playlist>, String>),
     Shows(Result<Vec<Show>, String>),
     TracksPage {
@@ -42,6 +42,18 @@ enum Msg {
         result: Result<SearchResults, String>,
     },
     Mix(Result<Vec<Track>, String>),
+    /// Similar songs for the queue that was playing when they were asked for.
+    Similar {
+        queue_id: u64,
+        result: Result<Vec<Track>, String>,
+    },
+    /// A playlist was made (and the songs to show it with).
+    PlaylistCreated(Result<Playlist, String>),
+    /// A playlist was changed; reload it if it is open.
+    PlaylistChanged {
+        id: String,
+        result: Result<String, String>,
+    },
     Cover {
         url: String,
         image: egui::ColorImage,
@@ -186,6 +198,37 @@ pub struct App {
     copied_at: Option<Instant>,
     /// The Fun tab's games. `None` while the Fun tab is turned off, so it takes no memory.
     fun: Option<Box<Fun>>,
+
+    /// Spotify user id, to know which playlists the user owns.
+    user_id: String,
+    /// Whether the login allows making and changing playlists.
+    can_edit_playlists: bool,
+    /// A request for similar songs is on its way.
+    similar_loading: bool,
+    /// Start playing the similar songs as soon as they arrive (the queue ran out).
+    similar_then_play: bool,
+    /// Changes whenever a new list starts playing, so late similar songs for an
+    /// earlier queue are dropped.
+    queue_id: u64,
+    /// The dialog on top of the window, if any.
+    dialog: Option<Dialog>,
+    /// Focus the big search box on the Search tab on the next frame.
+    focus_search: bool,
+}
+
+/// Small windows on top of the app.
+enum Dialog {
+    /// Name a new playlist; `tracks` are added to it right away.
+    NewPlaylist {
+        name: String,
+        tracks: Vec<Track>,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    /// The login is from before playlists could be changed.
+    NeedsLogin,
 }
 
 impl App {
@@ -243,6 +286,13 @@ impl App {
             cover_requested: None,
             sign_in_task: None,
             copied_at: None,
+            user_id: String::new(),
+            can_edit_playlists: false,
+            similar_loading: false,
+            similar_then_play: false,
+            queue_id: 0,
+            dialog: None,
+            focus_search: false,
         };
 
         #[cfg(debug_assertions)]
@@ -369,13 +419,17 @@ impl App {
 
         let outbox = self.outbox.clone();
         self.rt.spawn(async move {
-            if let Ok(name) = api.user_name().await {
-                outbox.send(Msg::UserName(name));
+            if let Ok(me) = api.me().await {
+                let can_edit = api.can_edit_playlists().await;
+                outbox.send(Msg::Me(me, can_edit));
             }
         });
         self.reload_playlists();
         self.open_list(TrackSource::LikedSongs);
-        self.start_player();
+        // Signing in again (for new permissions) keeps the player that is already running.
+        if self.player.is_none() {
+            self.start_player();
+        }
     }
 
     fn start_player(&mut self) {
@@ -518,6 +572,11 @@ impl App {
             error: None,
         };
         self.tab = Tab::Search;
+        let recent = &mut self.config.recent_searches;
+        recent.retain(|q| !q.eq_ignore_ascii_case(&query));
+        recent.insert(0, query.clone());
+        recent.truncate(8);
+        self.config.save();
         let outbox = self.outbox.clone();
         self.rt.spawn(async move {
             let result = api.search(&query).await.map_err(|e| format!("{e:#}"));
@@ -556,6 +615,11 @@ impl App {
             FunAction::Queue(tracks) => self.add_to_queue(tracks),
             FunAction::LoadPool(source) => self.load_fun_pool(source),
             FunAction::MakeSurpriseMix => self.make_surprise_mix(),
+            FunAction::SaveAsPlaylist(name, tracks) => {
+                if self.check_can_edit() {
+                    self.dialog = Some(Dialog::NewPlaylist { name, tracks });
+                }
+            }
         }
     }
 
@@ -617,8 +681,14 @@ impl App {
         } else {
             self.unshuffled = None;
         }
+        let single = tracks.len() == 1;
         self.queue = tracks;
-        self.play_at(index, true);
+        self.queue_id += 1;
+        self.similar_then_play = false;
+        if self.play_at(index, true) && single {
+            // Just one song: line up similar ones after it.
+            self.request_similar(false);
+        }
     }
 
     fn set_shuffle(&mut self, on: bool) {
@@ -667,6 +737,186 @@ impl App {
             format!("Added {n} songs to the queue")
         };
         self.notify(text);
+    }
+
+    /// Asks Spotify's radio for songs like the current one and adds them to the
+    /// end of the queue. With `then_play`, the queue has already run out and the
+    /// first of them starts playing.
+    fn request_similar(&mut self, then_play: bool) {
+        if !self.config.autoplay_similar {
+            return;
+        }
+        self.similar_then_play |= then_play;
+        if self.similar_loading {
+            return;
+        }
+        let (Some(player), Some(track)) = (self.player.clone(), self.now.track.clone()) else {
+            return;
+        };
+        if track.is_episode {
+            return;
+        }
+        self.similar_loading = true;
+        let skip: Vec<String> = self.queue.iter().map(|t| t.uri.clone()).collect();
+        let outbox = self.outbox.clone();
+        let queue_id = self.queue_id;
+        self.rt.spawn(async move {
+            let result = player
+                .similar_tracks(&track.uri, skip)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            outbox.send(Msg::Similar { queue_id, result });
+        });
+    }
+
+    fn on_similar(&mut self, queue_id: u64, result: Result<Vec<Track>, String>) {
+        self.similar_loading = false;
+        if queue_id != self.queue_id {
+            return; // a different list has started since
+        }
+        let then_play = std::mem::take(&mut self.similar_then_play);
+        match result {
+            Ok(mut tracks) => {
+                tracks.retain(|t| !self.queue.iter().any(|q| q.uri == t.uri));
+                tracks.shuffle(&mut rand::rng());
+                let n = tracks.len();
+                if n == 0 {
+                    return;
+                }
+                let at_end = self.queue_pos + 1 >= self.queue.len();
+                self.queue.extend(tracks);
+                if then_play && at_end {
+                    self.play_at(self.queue_pos + 1, true);
+                } else {
+                    self.notify(format!("Added {n} similar songs to Up next"));
+                }
+            }
+            Err(e) => {
+                log::warn!("No similar songs: {e}");
+                if then_play {
+                    self.notify("Reached the end of the list.");
+                    self.stop_at_end();
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ playlists
+
+    /// The playlists the signed-in user made (only those can be changed).
+    fn own_playlists(&self) -> Vec<(String, String)> {
+        self.playlists
+            .iter()
+            .filter(|p| !self.user_id.is_empty() && p.owner_id == self.user_id)
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect()
+    }
+
+    /// Checks that the login allows changing playlists; asks to sign in again if not.
+    fn check_can_edit(&mut self) -> bool {
+        if !self.can_edit_playlists {
+            self.dialog = Some(Dialog::NeedsLogin);
+        }
+        self.can_edit_playlists
+    }
+
+    fn create_playlist(&mut self, name: String, tracks: Vec<Track>) {
+        let Some(api) = self.api.clone() else { return };
+        if !self.check_can_edit() {
+            return;
+        }
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = async {
+                let playlist = api.create_playlist(&name).await?;
+                let uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
+                if !uris.is_empty() {
+                    api.add_to_playlist(&playlist.id, &uris).await?;
+                }
+                anyhow::Ok(api::Playlist {
+                    total: uris.len() as u32,
+                    ..playlist
+                })
+            }
+            .await
+            .map_err(|e| playlist_error("make the playlist", &e));
+            outbox.send(Msg::PlaylistCreated(result));
+        });
+    }
+
+    fn add_to_playlist(&mut self, playlist_id: String, tracks: Vec<Track>) {
+        let Some(api) = self.api.clone() else { return };
+        if !self.check_can_edit() {
+            return;
+        }
+        let name = self
+            .playlists
+            .iter()
+            .find(|p| p.id == playlist_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let uris: Vec<String> = tracks.iter().map(|t| t.uri.clone()).collect();
+            let result = api
+                .add_to_playlist(&playlist_id, &uris)
+                .await
+                .map(|()| match tracks.as_slice() {
+                    [one] => format!("Added \"{}\" to {name}", one.name),
+                    _ => format!("Added {} songs to {name}", tracks.len()),
+                })
+                .map_err(|e| playlist_error("add to the playlist", &e));
+            outbox.send(Msg::PlaylistChanged {
+                id: playlist_id,
+                result,
+            });
+        });
+    }
+
+    fn remove_from_playlist(&mut self, playlist_id: String, track: Track) {
+        let Some(api) = self.api.clone() else { return };
+        if !self.check_can_edit() {
+            return;
+        }
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = api
+                .remove_from_playlist(&playlist_id, &track.uri)
+                .await
+                .map(|()| format!("Removed \"{}\"", track.name))
+                .map_err(|e| playlist_error("remove the song", &e));
+            outbox.send(Msg::PlaylistChanged {
+                id: playlist_id,
+                result,
+            });
+        });
+    }
+
+    fn rename_playlist(&mut self, playlist_id: String, name: String) {
+        let Some(api) = self.api.clone() else { return };
+        if !self.check_can_edit() {
+            return;
+        }
+        if let Some(p) = self.playlists.iter_mut().find(|p| p.id == playlist_id) {
+            p.name = name.clone();
+        }
+        if let Some(TrackSource::Playlist { id, name: shown }) = &mut self.library.source
+            && *id == playlist_id
+        {
+            *shown = name.clone();
+        }
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = api
+                .rename_playlist(&playlist_id, &name)
+                .await
+                .map(|()| format!("Renamed the playlist to \"{name}\""))
+                .map_err(|e| playlist_error("rename the playlist", &e));
+            outbox.send(Msg::PlaylistChanged {
+                id: playlist_id,
+                result,
+            });
+        });
     }
 
     /// Plays the first playable track at or after (or before, if `forward` is
@@ -718,7 +968,18 @@ impl App {
         if self.config.repeat == Repeat::All && self.play_at(0, true) {
             return;
         }
-        // End of the list.
+        if self.config.autoplay_similar && self.now.track.as_ref().is_some_and(|t| !t.is_episode) {
+            // Keep the music going with similar songs once they arrive.
+            self.request_similar(true);
+            if self.similar_loading {
+                return;
+            }
+        }
+        self.stop_at_end();
+    }
+
+    /// The queue ran out: stop and rewind the current song.
+    fn stop_at_end(&mut self) {
         if let Some(p) = &self.player {
             p.stop();
         }
@@ -834,8 +1095,11 @@ impl App {
             }
             PlayerMsg::Stopped => {}
             PlayerMsg::PreloadNext => {
-                if let (Some(p), Some(t)) = (&self.player, self.upcoming()) {
-                    p.preload(&t.uri);
+                match (&self.player, self.upcoming()) {
+                    (Some(p), Some(t)) => p.preload(&t.uri),
+                    // The queue is about to run out: fetch similar songs in time.
+                    (Some(_), None) => self.request_similar(false),
+                    _ => {}
                 }
             }
             PlayerMsg::EndOfTrack { uri } if is_current(&uri) => {
@@ -885,7 +1149,38 @@ impl App {
                     self.config.refresh_token = Some(token);
                     self.config.save();
                 }
-                Msg::UserName(name) => self.user_name = name,
+                Msg::Me(me, can_edit) => {
+                    self.user_name = me.name;
+                    self.user_id = me.id;
+                    self.can_edit_playlists = can_edit;
+                }
+                Msg::Similar { queue_id, result } => self.on_similar(queue_id, result),
+                Msg::PlaylistCreated(result) => match result {
+                    Ok(playlist) => {
+                        self.notify(format!("Made the playlist \"{}\"", playlist.name));
+                        let source = TrackSource::Playlist {
+                            id: playlist.id.clone(),
+                            name: playlist.name.clone(),
+                        };
+                        self.playlists.insert(0, playlist);
+                        self.open_list(source);
+                    }
+                    Err(e) => self.notify(e),
+                },
+                Msg::PlaylistChanged { id, result } => match result {
+                    Ok(message) => {
+                        self.notify(message);
+                        let open = matches!(&self.library.source,
+                            Some(TrackSource::Playlist { id: open, .. }) if *open == id);
+                        if open && let Some(source) = self.library.source.clone() {
+                            let tab = self.tab;
+                            self.open_list(source);
+                            self.tab = tab;
+                        }
+                        self.reload_playlists();
+                    }
+                    Err(e) => self.notify(e),
+                },
                 Msg::Playlists(result) => {
                     self.playlists_loading = false;
                     match result {
@@ -961,12 +1256,20 @@ impl App {
     fn fill_demo_data(&mut self, which: &str) {
         self.screen = Screen::Main;
         self.user_name = "Demo".into();
+        self.user_id = "demo".into();
+        self.can_edit_playlists = true;
+        self.config.recent_searches = vec![
+            "daft punk".into(),
+            "lofi beats".into(),
+            "taylor swift".into(),
+        ];
         self.player_state = PlayerState::Ready;
         self.playlists = (1..=24)
             .map(|i| Playlist {
                 id: format!("demo{i}"),
                 name: format!("Playlist number {i} with a fairly long name"),
                 owner: "Demo".into(),
+                owner_id: "demo".into(),
                 total: 20,
             })
             .collect();
@@ -1069,6 +1372,7 @@ impl App {
                 };
             }
             "settings" => self.tab = Tab::Settings,
+            "search-empty" => self.tab = Tab::Search,
             game if game.starts_with("fun") => {
                 self.tab = Tab::Fun;
                 if let Some(fun) = &mut self.fun {
@@ -1081,6 +1385,18 @@ impl App {
             _ => {}
         }
         self.notify("\"Song title 4\" is not available, skipped it.");
+    }
+}
+
+/// A readable message for a failed playlist change.
+fn playlist_error(what: &str, e: &anyhow::Error) -> String {
+    if api::is_status(e, reqwest::StatusCode::FORBIDDEN) {
+        format!(
+            "Spotify did not allow lite-spotify to {what} ({e}). Spotify limits what personal \
+             developer apps may change; you can still do it in the Spotify app."
+        )
+    } else {
+        format!("Could not {what}: {e:#}")
     }
 }
 

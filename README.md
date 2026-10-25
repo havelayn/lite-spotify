@@ -7,7 +7,12 @@ Built in Rust with [egui](https://github.com/emilk/egui) for the window and
 What it can do:
 
 - **Library:** Liked Songs and your playlists, in a simple song table.
-- **Search:** songs, albums, playlists and podcasts.
+- **Search:** songs, albums, playlists and podcasts, with recent searches and quick ideas
+  (Chill, Workout, Focus, …) for when you don't know what to look for.
+- **Your own playlists:** make new ones, add songs (right-click a song → Add to playlist,
+  or "+ Add to playlist" under the song that is playing), remove songs and rename them.
+- **Similar songs:** after a single song, or when a list ends, lite-spotify keeps playing
+  shuffled songs in the same style (from Spotify's own radio). Turn it off in Settings.
 - **Podcasts:** the shows you follow and their episodes.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
   repeat, volume, and an **Up next** list. Right-click a song to add it to the queue.
@@ -77,6 +82,10 @@ Next time you start the app you are signed in automatically.
   the `player` folder holds the player's saved login. `lite-spotify.log` is the log file.
   Please attach it when you report a bug.
 - **Sign out / use a different Client ID:** open the **Settings** tab.
+- **"One more permission":** making playlists needs a permission that versions before 0.4.0
+  didn't ask for. The app asks you to sign in once more the first time you make a playlist.
+- **Playlist changes refused:** Spotify limits what personal developer apps may change. If
+  Spotify refuses, the app says so; you can still make the change in the Spotify app.
 - **Turn off the Fun tab:** Settings → Fun tab. The games use almost no memory, and none
   while turned off.
 - **Some playlists do not open:** Spotify limits what developer apps may read. If a playlist
