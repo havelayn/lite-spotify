@@ -196,7 +196,7 @@ impl Slots {
             egui::Align2::CENTER_CENTER,
             label,
             theme::bold(15.0),
-            theme::ON_ACCENT,
+            theme::on_accent(),
         );
 
         if (spin_button.clicked() || lever.clicked()) && self.spin.is_none() {

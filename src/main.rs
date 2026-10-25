@@ -9,7 +9,9 @@ mod fun;
 mod media;
 mod player;
 mod session;
+mod stats;
 mod theme;
+mod tray;
 mod update;
 mod widgets;
 
@@ -31,7 +33,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("lite-spotify")
             .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([860.0, 540.0]),
+            .with_min_inner_size([860.0, 540.0])
+            .with_icon(std::sync::Arc::new(egui::IconData {
+                rgba: tray::icon_rgba(64),
+                width: 64,
+                height: 64,
+            })),
         ..Default::default()
     };
     eframe::run_native(

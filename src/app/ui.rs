@@ -13,7 +13,8 @@ use super::{App, Dialog, ListView, NOTICE_TIME, PlayerState, Screen, Sleep, Tab}
 use crate::api::{Track, TrackSource};
 use crate::auth;
 use crate::config::{self, Repeat};
-use crate::theme::{self, BG, BORDER, ERROR, HOVER, MUTED, RAISED, SUBDUED, SURFACE, TEXT};
+use crate::stats;
+use crate::theme::{self, bg, border, hover, muted, raised, subdued, surface};
 use crate::widgets::{self, ButtonStyle, Icon, RowAction, RowMenu, RowState, format_time};
 
 /// What the user did in a song list.
@@ -64,7 +65,7 @@ const SHORTCUTS: [(&str, &str); 10] = [
     ("S", "Shuffle on / off"),
     ("R", "Repeat: off, list, song"),
     ("Ctrl + F", "Search"),
-    ("Ctrl + 1 \u{2026} 5", "Switch tabs"),
+    ("Ctrl + 1 \u{2026} 6", "Switch tabs"),
 ];
 
 impl eframe::App for App {
@@ -72,8 +73,20 @@ impl eframe::App for App {
     /// next song still starts and the sleep timer still works.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages(ctx);
+        self.track_listening();
+        if self.tab != Tab::Stats {
+            self.stats = None;
+        }
+        self.update_lyrics();
         self.tick_sleep(ctx);
+        if self.tab != Tab::Fun || self.lyrics_open {
+            // Leaving the Fun tab ends Guess the Song.
+            self.end_quiz();
+        }
+        self.tick_quiz(ctx);
         self.update_media_popup();
+        self.update_tray();
+        self.handle_close(ctx);
         if self.now.playing {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -98,6 +111,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
         self.save_session();
+        self.finish_listen();
     }
 }
 
@@ -119,7 +133,8 @@ impl App {
             (Key::Num2, Tab::Search),
             (Key::Num3, Tab::Podcasts),
             (Key::Num4, Tab::Fun),
-            (Key::Num5, Tab::Settings),
+            (Key::Num5, Tab::Stats),
+            (Key::Num6, Tab::Settings),
         ];
         for (key, tab) in tabs {
             if pressed(M::COMMAND, key) && (tab != Tab::Fun || self.fun.is_some()) {
@@ -187,15 +202,15 @@ impl App {
     /// A card in the middle of the window, used by the setup and sign-in screens.
     fn centered_card(ui: &mut Ui, width: f32, add_contents: impl FnOnce(&mut Ui)) {
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG))
+            .frame(Frame::new().fill(bg()))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let width = width.min(ui.available_width() - 32.0);
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.06).clamp(16.0, 80.0));
                         Frame::new()
-                            .fill(SURFACE)
-                            .stroke(Stroke::new(1.0, BORDER))
+                            .fill(surface())
+                            .stroke(Stroke::new(1.0, border()))
                             .corner_radius(14)
                             .inner_margin(32)
                             .show(ui, |ui| {
@@ -228,7 +243,7 @@ impl App {
                 ui.label(
                     RichText::new("Welcome to lite-spotify")
                         .font(theme::bold(26.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
             });
             ui.add_space(8.0);
@@ -237,7 +252,7 @@ impl App {
                     "lite-spotify connects to Spotify through your own free developer app. \
                      This takes about three minutes and only has to be done once.",
                 )
-                .color(SUBDUED),
+                .color(subdued()),
             );
             ui.add_space(18.0);
 
@@ -258,14 +273,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_space(36.0);
                 Frame::new()
-                    .fill(RAISED)
+                    .fill(raised())
                     .corner_radius(6)
                     .inner_margin(Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(auth::WEB_REDIRECT_URI)
                                 .monospace()
-                                .color(TEXT),
+                                .color(theme::text()),
                         );
                     });
                 let label = if copied { "Copied" } else { "Copy" };
@@ -294,7 +309,7 @@ impl App {
             }
             if let Some(e) = error {
                 ui.add_space(4.0);
-                ui.label(RichText::new(e.as_str()).color(ERROR));
+                ui.label(RichText::new(e.as_str()).color(theme::error()));
             }
             ui.add_space(14.0);
             let width = ui.available_width();
@@ -315,7 +330,7 @@ impl App {
                     "Settings are saved in {}",
                     config::app_dir().display()
                 ))
-                .color(MUTED)
+                .color(muted())
                 .small(),
             );
         });
@@ -355,18 +370,22 @@ impl App {
                 ui.label(
                     RichText::new("lite-spotify")
                         .font(theme::bold(30.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
                 ui.label(
-                    RichText::new("A small player for your Spotify Premium account").color(SUBDUED),
+                    RichText::new("A small player for your Spotify Premium account")
+                        .color(subdued()),
                 );
                 ui.add_space(26.0);
                 if busy {
                     ui.add(egui::Spinner::new().size(28.0).color(theme::accent()));
                     ui.add_space(12.0);
                     if let Some(url) = &url {
-                        ui.label(RichText::new("Finish signing in in your browser,").color(TEXT));
-                        ui.label(RichText::new("then come back here.").color(TEXT));
+                        ui.label(
+                            RichText::new("Finish signing in in your browser,")
+                                .color(theme::text()),
+                        );
+                        ui.label(RichText::new("then come back here.").color(theme::text()));
                         ui.add_space(12.0);
                         ui.hyperlink_to("Browser did not open? Click here.", url);
                         ui.add_space(18.0);
@@ -374,11 +393,11 @@ impl App {
                             cancel = true;
                         }
                     } else {
-                        ui.label(RichText::new("Signing in…").color(TEXT));
+                        ui.label(RichText::new("Signing in…").color(theme::text()));
                     }
                 } else {
                     if let Some(e) = &error {
-                        ui.label(RichText::new(e).color(ERROR));
+                        ui.label(RichText::new(e).color(theme::error()));
                         ui.add_space(16.0);
                     }
                     let width = ui.available_width();
@@ -396,7 +415,7 @@ impl App {
                     ui.add_space(14.0);
                     let other = ui.add(
                         egui::Button::new(
-                            RichText::new("Use a different Client ID").color(SUBDUED),
+                            RichText::new("Use a different Client ID").color(subdued()),
                         )
                         .frame(false),
                     );
@@ -423,12 +442,24 @@ impl App {
     // ---------------------------------------------------------- main window
 
     fn main_screen(&mut self, ui: &mut Ui) {
+        if self.mini.is_some() {
+            self.mini_player(ui);
+            return;
+        }
+        if self.karaoke {
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.set_karaoke(&ui.ctx().clone(), false);
+            }
+            self.karaoke_screen(ui);
+            self.toast(ui.ctx());
+            return;
+        }
         egui::Panel::top("top")
             .exact_size(54.0)
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(SURFACE)
+                    .fill(surface())
                     .inner_margin(Margin::symmetric(14, 0)),
             )
             .show(ui, |ui| self.top_bar(ui));
@@ -436,18 +467,23 @@ impl App {
             .resizable(true)
             .default_size(300.0)
             .size_range(230.0..=420.0)
-            .frame(Frame::new().fill(SURFACE).inner_margin(Margin::same(16)))
+            .frame(Frame::new().fill(surface()).inner_margin(Margin::same(16)))
             .show(ui, |ui| self.now_playing_panel(ui));
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG))
+            .frame(Frame::new().fill(bg()))
             .show(ui, |ui| {
                 self.update_banner(ui);
                 self.player_banner(ui);
+                if self.lyrics_open {
+                    self.lyrics_view(ui, false);
+                    return;
+                }
                 match self.tab {
                     Tab::Library => self.library_tab(ui),
                     Tab::Search => self.search_tab(ui),
                     Tab::Podcasts => self.podcasts_tab(ui),
                     Tab::Fun => self.fun_tab(ui),
+                    Tab::Stats => self.stats_tab(ui),
                     Tab::Settings => self.settings_tab(ui),
                 }
             });
@@ -457,14 +493,17 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         let bar = ui.max_rect();
-        ui.painter()
-            .hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, BORDER));
+        ui.painter().hline(
+            bar.x_range(),
+            bar.bottom() - 0.5,
+            Stroke::new(1.0, border()),
+        );
         ui.horizontal_centered(|ui| {
             widgets::logo(ui, 26.0);
             ui.label(
                 RichText::new("lite-spotify")
                     .font(theme::bold(16.0))
-                    .color(TEXT),
+                    .color(theme::text()),
             );
             ui.add_space(18.0);
             let mut tabs = vec![
@@ -475,21 +514,31 @@ impl App {
             if self.fun.is_some() {
                 tabs.push((Tab::Fun, "Fun"));
             }
+            tabs.push((Tab::Stats, "Stats"));
             tabs.push((Tab::Settings, "Settings"));
             for (tab, label) in tabs {
-                if tab_button(ui, label, self.tab == tab, bar.bottom()).clicked() {
+                let selected = self.tab == tab && !self.lyrics_open;
+                if tab_button(ui, label, selected, bar.bottom()).clicked() {
                     self.tab = tab;
+                    self.lyrics_open = false;
                     if tab == Tab::Search {
                         self.focus_search = true;
                     }
                 }
             }
 
-            // The Search tab has its own big search box.
-            if self.tab == Tab::Search {
-                return;
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::icon_button(ui, Icon::MiniPlayer, 18.0, true, false)
+                    .on_hover_text("Mini player: a small window that stays on top")
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.set_mini(&ctx, true);
+                }
+                // The Search tab has its own big search box.
+                if self.tab == Tab::Search {
+                    return;
+                }
                 let width = (ui.available_width() - 8.0).clamp(140.0, 300.0);
                 let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
                 if self.search_box(ui, rect) {
@@ -508,14 +557,14 @@ impl App {
             ui.memory_mut(|m| m.request_focus(id));
         }
         let fill = if focused || background.hovered() {
-            HOVER
+            hover()
         } else {
-            RAISED
+            raised()
         };
         let stroke = if focused {
             Stroke::new(1.5, theme::accent())
         } else {
-            Stroke::new(1.0, BORDER)
+            Stroke::new(1.0, border())
         };
         ui.painter().rect(
             rect,
@@ -526,7 +575,7 @@ impl App {
         );
         let icon =
             Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(15.0));
-        widgets::paint_icon(ui.painter(), icon, Icon::Search, SUBDUED);
+        widgets::paint_icon(ui.painter(), icon, Icon::Search, subdued());
         let text_rect = Rect::from_min_max(
             pos2(rect.left() + 34.0, rect.top()),
             pos2(rect.right() - 30.0, rect.bottom()),
@@ -585,11 +634,15 @@ impl App {
         match &self.now.track {
             Some(t) => {
                 ui.add(
-                    egui::Label::new(RichText::new(&t.name).font(theme::bold(18.0)).color(TEXT))
-                        .truncate(),
+                    egui::Label::new(
+                        RichText::new(&t.name)
+                            .font(theme::bold(18.0))
+                            .color(theme::text()),
+                    )
+                    .truncate(),
                 );
-                ui.add(egui::Label::new(RichText::new(&t.artists).color(SUBDUED)).truncate());
-                ui.add(egui::Label::new(RichText::new(&t.album).small().color(MUTED)).truncate());
+                ui.add(egui::Label::new(RichText::new(&t.artists).color(subdued())).truncate());
+                ui.add(egui::Label::new(RichText::new(&t.album).small().color(muted())).truncate());
                 ui.add_space(4.0);
                 let liked = self.is_liked(&t.uri);
                 let mut button = None;
@@ -637,9 +690,9 @@ impl App {
                 ui.label(
                     RichText::new("Nothing playing")
                         .font(theme::bold(18.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
-                ui.label(RichText::new(self.player_status_text()).color(SUBDUED));
+                ui.label(RichText::new(self.player_status_text()).color(subdued()));
                 ui.label(RichText::new(" ").small());
             }
         }
@@ -692,14 +745,14 @@ impl App {
             egui::Align2::LEFT_CENTER,
             format_time(shown_ms),
             font.clone(),
-            SUBDUED,
+            subdued(),
         );
         ui.painter().text(
             times.right_center(),
             egui::Align2::RIGHT_CENTER,
             format_time(duration_ms),
             font,
-            SUBDUED,
+            subdued(),
         );
         ui.add_space(6.0);
 
@@ -786,14 +839,19 @@ impl App {
         ui.painter().hline(
             ui.max_rect().x_range(),
             ui.cursor().top(),
-            Stroke::new(1.0, BORDER),
+            Stroke::new(1.0, border()),
         );
         ui.add_space(10.0);
         self.up_next(ui);
     }
 
-    /// "Sleep timer" with a menu of times; shows the time left while it runs.
+    /// "Lyrics" and "Sleep timer" under the volume.
     fn sleep_timer_button(&mut self, ui: &mut Ui) {
+        let lyrics_label = if self.lyrics_open {
+            "Hide lyrics"
+        } else {
+            "Lyrics"
+        };
         let label = match self.sleep {
             None => "Sleep timer".to_string(),
             Some(Sleep::EndOfSong) => "Sleep: after this song".to_string(),
@@ -804,6 +862,12 @@ impl App {
         };
         let mut chosen: Option<Option<Sleep>> = None;
         ui.horizontal(|ui| {
+            if widgets::button(ui, lyrics_label, ButtonStyle::Ghost, 12.0)
+                .on_hover_text("The words of the song, line by line")
+                .clicked()
+            {
+                self.lyrics_open = !self.lyrics_open;
+            }
             let button = widgets::button(ui, &label, ButtonStyle::Ghost, 12.0)
                 .on_hover_text("Pause the music after a while");
             egui::Popup::menu(&button).show(|ui| {
@@ -854,14 +918,14 @@ impl App {
             ui.label(
                 RichText::new("UP NEXT")
                     .font(theme::bold(12.0))
-                    .color(MUTED),
+                    .color(muted()),
             );
             if left > 0 {
-                ui.label(RichText::new(left.to_string()).small().color(MUTED));
+                ui.label(RichText::new(left.to_string()).small().color(muted()));
             }
         });
         if left == 0 {
-            ui.label(RichText::new("Nothing queued.").color(MUTED));
+            ui.label(RichText::new("Nothing queued.").color(muted()));
             return;
         }
         let mut jump = None;
@@ -874,7 +938,8 @@ impl App {
                     let (rect, response) =
                         ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
                     if response.hovered() {
-                        ui.painter().rect_filled(rect, CornerRadius::same(6), HOVER);
+                        ui.painter()
+                            .rect_filled(rect, CornerRadius::same(6), hover());
                     }
                     let queued = offset < self.user_queued;
                     let text = rect.shrink2(vec2(8.0, 3.0));
@@ -885,7 +950,7 @@ impl App {
                             .layout(Layout::top_down(Align::Min)),
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            let color = if t.playable { TEXT } else { MUTED };
+                            let color = if t.playable { theme::text() } else { muted() };
                             ui.add(
                                 egui::Label::new(RichText::new(&t.name).color(color)).truncate(),
                             );
@@ -894,7 +959,7 @@ impl App {
                             } else {
                                 t.artists.clone()
                             };
-                            let color = if queued { theme::accent() } else { SUBDUED };
+                            let color = if queued { theme::accent() } else { subdued() };
                             ui.add(
                                 egui::Label::new(RichText::new(artist).small().color(color))
                                     .truncate(),
@@ -921,6 +986,337 @@ impl App {
         }
     }
 
+    /// The lyrics of the current song. The line being sung is highlighted and
+    /// kept in the middle; click a line to jump to it.
+    fn lyrics_view(&mut self, ui: &mut Ui, karaoke: bool) {
+        let ctx = ui.ctx().clone();
+        let (title, artist) = match &self.now.track {
+            Some(t) => (t.name.clone(), t.artists.clone()),
+            None => ("Nothing playing".to_string(), String::new()),
+        };
+        let mut close = false;
+        let mut toggle_karaoke = false;
+        let margin = if karaoke { 40 } else { 20 };
+        Frame::new()
+            .inner_margin(Margin::symmetric(margin, 14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("LYRICS")
+                                .font(theme::bold(11.0))
+                                .color(theme::accent()),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&title)
+                                    .font(theme::bold(22.0))
+                                    .color(theme::text()),
+                            )
+                            .truncate(),
+                        );
+                        ui.label(RichText::new(&artist).color(subdued()));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if widgets::icon_button(ui, Icon::Close, 12.0, true, false)
+                            .on_hover_text(if karaoke { "Close (Esc)" } else { "Close" })
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                        let label = if karaoke {
+                            "Leave full screen"
+                        } else {
+                            "Full screen"
+                        };
+                        if widgets::button(ui, label, ButtonStyle::Ghost, 13.0)
+                            .on_hover_text("Karaoke: big lyrics on the whole screen")
+                            .clicked()
+                        {
+                            toggle_karaoke = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                self.lyrics_lines(ui, karaoke);
+            });
+        if toggle_karaoke {
+            self.set_karaoke(&ctx, !karaoke);
+        }
+        if close {
+            if karaoke {
+                self.set_karaoke(&ctx, false);
+            }
+            self.lyrics_open = false;
+        }
+    }
+
+    fn lyrics_lines(&mut self, ui: &mut Ui, karaoke: bool) {
+        let center = |ui: &mut Ui, text: RichText| {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| ui.label(text));
+        };
+        let lyrics = match &self.lyrics {
+            _ if self.now.track.is_none() => {
+                center(
+                    ui,
+                    RichText::new("Play a song to see its lyrics.").color(subdued()),
+                );
+                return;
+            }
+            None | Some((_, None)) => {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(egui::Spinner::new().size(28.0).color(theme::accent()))
+                });
+                return;
+            }
+            Some((_, Some(Err(_)))) => {
+                center(
+                    ui,
+                    RichText::new("No lyrics for this song.")
+                        .font(theme::bold(18.0))
+                        .color(subdued()),
+                );
+                return;
+            }
+            Some((_, Some(Ok(lyrics)))) => lyrics,
+        };
+        let position = self.now.position_ms();
+        let current = if lyrics.synced {
+            lyrics.lines.iter().rposition(|l| l.start_ms <= position)
+        } else {
+            None
+        };
+        let size = if karaoke { 34.0 } else { 22.0 };
+        // In karaoke, Spotify's own colours for these lyrics.
+        let (text, sung, upcoming) = match lyrics.colors {
+            Some([_, t, h]) if karaoke => {
+                let t = Color32::from_rgb(t[0], t[1], t[2]);
+                let h = Color32::from_rgb(h[0], h[1], h[2]);
+                (h, h.gamma_multiply(0.55), t)
+            }
+            _ => (theme::text(), muted(), subdued()),
+        };
+        let mut seek_to = None;
+        let mut scrolled = self.lyrics_scrolled_to;
+        let height = ui.available_height();
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = if karaoke { 18.0 } else { 10.0 };
+                    ui.add_space(height * 0.25);
+                    for (i, line) in lyrics.lines.iter().enumerate() {
+                        let color = match current {
+                            Some(c) if c == i => text,
+                            Some(c) if i < c => sung,
+                            _ if lyrics.synced => upcoming,
+                            _ => text,
+                        };
+                        let words = if line.words.trim().is_empty() {
+                            "\u{266a}"
+                        } else {
+                            line.words.as_str()
+                        };
+                        let font = if current == Some(i) {
+                            theme::bold(size)
+                        } else {
+                            theme::regular(size)
+                        };
+                        let mut label =
+                            egui::Label::new(RichText::new(words).font(font).color(color));
+                        if lyrics.synced {
+                            label = label.sense(Sense::click());
+                        }
+                        let response = ui.add(label);
+                        if current == Some(i) && scrolled != current {
+                            response.scroll_to_me(Some(Align::Center));
+                            scrolled = current;
+                        }
+                        if lyrics.synced
+                            && response
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                        {
+                            seek_to = Some(line.start_ms);
+                        }
+                    }
+                    ui.add_space(24.0);
+                    if !lyrics.synced {
+                        ui.label(
+                            RichText::new("These lyrics are not timed, so no line is highlighted.")
+                                .small()
+                                .color(muted()),
+                        );
+                    }
+                    if !lyrics.provider.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Lyrics provided by {}", lyrics.provider))
+                                .small()
+                                .color(muted()),
+                        );
+                    }
+                    ui.add_space(height * 0.35);
+                });
+            });
+        self.lyrics_scrolled_to = scrolled;
+        if let Some(ms) = seek_to {
+            self.seek(ms);
+            self.lyrics_scrolled_to = None;
+        }
+        if self.now.playing {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// Full-screen karaoke: the lyrics on the song's own colour, with small
+    /// play controls at the bottom.
+    fn karaoke_screen(&mut self, ui: &mut Ui) {
+        let background = match &self.lyrics {
+            Some((_, Some(Ok(l)))) => l.colors.map(|c| c[0]),
+            _ => None,
+        }
+        .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+        .unwrap_or(bg());
+        let enabled = self.player_ready() && self.now.track.is_some();
+        let mut action = None;
+        egui::Panel::bottom("karaoke-controls")
+            .exact_size(76.0)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(background))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let total = 2.0 * 26.0 + 48.0 + 2.0 * 10.0;
+                    ui.add_space((ui.available_width() - total) / 2.0);
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if widgets::icon_button(ui, Icon::Previous, 16.0, enabled, false).clicked() {
+                        action = Some(1);
+                    }
+                    if widgets::play_button(ui, 48.0, self.now.playing, enabled).clicked() {
+                        action = Some(2);
+                    }
+                    if widgets::icon_button(ui, Icon::Next, 16.0, enabled, false).clicked() {
+                        action = Some(3);
+                    }
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(background))
+            .show(ui, |ui| self.lyrics_view(ui, true));
+        match action {
+            Some(1) => self.previous(),
+            Some(2) => self.toggle_play(),
+            Some(3) => self.next(),
+            _ => {}
+        }
+    }
+
+    /// The mini player: cover, song and buttons in a small window on top.
+    fn mini_player(&mut self, ui: &mut Ui) {
+        let enabled = self.player_ready() && self.now.track.is_some();
+        let mut action = None;
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(surface()).inner_margin(Margin::same(10)))
+            .show(ui, |ui| {
+                let full = ui.max_rect();
+                let cover_size = full.height().min(96.0);
+                let cover = Rect::from_min_size(full.min, Vec2::splat(cover_size));
+                let texture = self
+                    .cover
+                    .as_ref()
+                    .filter(|_| self.now.track.is_some())
+                    .map(|(_, t)| t);
+                widgets::paint_cover(ui, cover, texture, Icon::Note, 8);
+                let right = Rect::from_min_max(pos2(cover.right() + 12.0, full.top()), full.max);
+                widgets::place(
+                    ui,
+                    egui::UiBuilder::new()
+                        .max_rect(right)
+                        .layout(Layout::top_down(Align::Min)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let (title, artist) = match &self.now.track {
+                            Some(t) => (t.name.as_str(), t.artists.as_str()),
+                            None => ("Nothing playing", ""),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                if widgets::icon_button(ui, Icon::Expand, 13.0, true, false)
+                                    .on_hover_text("Back to the full window")
+                                    .clicked()
+                                {
+                                    action = Some(0);
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title)
+                                            .font(theme::bold(15.0))
+                                            .color(theme::text()),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        });
+                        ui.add(egui::Label::new(RichText::new(artist).color(subdued())).truncate());
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::icon_button(ui, Icon::Previous, 14.0, enabled, false)
+                                .clicked()
+                            {
+                                action = Some(1);
+                            }
+                            if widgets::play_button(ui, 36.0, self.now.playing, enabled).clicked() {
+                                action = Some(2);
+                            }
+                            if widgets::icon_button(ui, Icon::Next, 14.0, enabled, false).clicked()
+                            {
+                                action = Some(3);
+                            }
+                            if let Some(t) = &self.now.track {
+                                let liked = self.is_liked(&t.uri);
+                                if widgets::heart_button(ui, 14.0, liked).clicked() {
+                                    action = Some(4);
+                                }
+                            }
+                        });
+                        // A thin progress line.
+                        let duration = self.now.track.as_ref().map_or(0, |t| t.duration_ms);
+                        if duration > 0 {
+                            let fraction = self.now.position_ms() as f32 / duration as f32;
+                            let line = Rect::from_min_size(
+                                pos2(right.left(), right.bottom() - 3.0),
+                                vec2(right.width(), 3.0),
+                            );
+                            ui.painter()
+                                .rect_filled(line, CornerRadius::same(2), border());
+                            let mut done = line;
+                            done.set_right(line.left() + line.width() * fraction.clamp(0.0, 1.0));
+                            ui.painter()
+                                .rect_filled(done, CornerRadius::same(2), theme::accent());
+                        }
+                    },
+                );
+            });
+        self.toast(ui.ctx());
+        match action {
+            Some(0) => {
+                let ctx = ui.ctx().clone();
+                self.set_mini(&ctx, false);
+            }
+            Some(1) => self.previous(),
+            Some(2) => self.toggle_play(),
+            Some(3) => self.next(),
+            Some(4) => {
+                if let Some(t) = self.now.track.clone() {
+                    self.toggle_like(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// "A new version is out", with a download button.
     fn update_banner(&mut self, ui: &mut Ui) {
         let Some(release) = &self.update else { return };
@@ -937,11 +1333,11 @@ impl App {
                     ui.label(
                         RichText::new(format!("lite-spotify {} is out!", release.version))
                             .font(theme::bold(14.0))
-                            .color(TEXT),
+                            .color(theme::text()),
                     );
                     ui.label(
                         RichText::new(concat!("You have ", env!("CARGO_PKG_VERSION"), "."))
-                            .color(SUBDUED),
+                            .color(subdued()),
                     );
                     if widgets::button(ui, "Download", ButtonStyle::Accent, 13.0)
                         .on_hover_text("Downloads the new .exe in your browser. Close this one and start the new one; your settings and login stay.")
@@ -970,14 +1366,14 @@ impl App {
         let mut retry = false;
         let (fill, text, link) = match &self.player_state {
             PlayerState::BrowserLogin(url) => (
-                Color32::from_rgb(0x1d, 0x2f, 0x4f),
+                theme::selected(),
                 "One more step: a browser tab asks you to allow playback. \
                  This is Spotify's own login for the audio player."
                     .to_string(),
                 Some(url.clone()),
             ),
             PlayerState::Failed(e) => (
-                Color32::from_rgb(0x4a, 0x1c, 0x26),
+                theme::error().gamma_multiply(0.25),
                 format!("Player: {e}"),
                 None,
             ),
@@ -991,7 +1387,7 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(text).color(TEXT));
+                    ui.label(RichText::new(text).color(theme::text()));
                     if let Some(url) = &link {
                         ui.hyperlink_to("Open it again", url);
                     } else if widgets::button(ui, "Retry", ButtonStyle::Ghost, 13.0).clicked() {
@@ -1014,13 +1410,13 @@ impl App {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(SURFACE)
+                    .fill(surface())
                     .inner_margin(Margin::symmetric(10, 12)),
             )
             .show(ui, |ui| {
                 let rect = ui.max_rect().expand2(vec2(10.0, 12.0));
                 ui.painter()
-                    .vline(rect.right(), rect.y_range(), Stroke::new(1.0, BORDER));
+                    .vline(rect.right(), rect.y_range(), Stroke::new(1.0, border()));
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
@@ -1049,13 +1445,13 @@ impl App {
                 ui.label(
                     RichText::new("PLAYLISTS")
                         .font(theme::bold(12.0))
-                        .color(MUTED),
+                        .color(muted()),
                 );
                 if self.playlists_loading {
-                    ui.add(egui::Spinner::new().size(12.0).color(MUTED));
+                    ui.add(egui::Spinner::new().size(12.0).color(muted()));
                 } else if ui
                     .add(
-                        egui::Button::new(RichText::new("Reload").small().color(MUTED))
+                        egui::Button::new(RichText::new("Reload").small().color(muted()))
                             .frame(false),
                     )
                     .clicked()
@@ -1081,7 +1477,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(BG)
+                    .fill(bg())
                     .inner_margin(Margin::symmetric(20, 14)),
             )
             .show(ui, |ui| {
@@ -1114,13 +1510,13 @@ impl App {
                 ui.label(
                     RichText::new("YOUR PODCASTS")
                         .font(theme::bold(12.0))
-                        .color(MUTED),
+                        .color(muted()),
                 );
                 if self.shows_loading {
-                    ui.add(egui::Spinner::new().size(12.0).color(MUTED));
+                    ui.add(egui::Spinner::new().size(12.0).color(muted()));
                 } else if ui
                     .add(
-                        egui::Button::new(RichText::new("Reload").small().color(MUTED))
+                        egui::Button::new(RichText::new("Reload").small().color(muted()))
                             .frame(false),
                     )
                     .clicked()
@@ -1134,7 +1530,7 @@ impl App {
                         "No podcasts yet. Follow some in Spotify, or find them with Search.",
                     )
                     .small()
-                    .color(MUTED),
+                    .color(muted()),
                 );
             }
             for s in &self.shows {
@@ -1157,7 +1553,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(BG)
+                    .fill(bg())
                     .inner_margin(Margin::symmetric(20, 14)),
             )
             .show(ui, |ui| {
@@ -1166,11 +1562,11 @@ impl App {
                     ui.label(
                         RichText::new("Podcasts")
                             .font(theme::bold(26.0))
-                            .color(TEXT),
+                            .color(theme::text()),
                     );
                     ui.label(
                         RichText::new("Pick a podcast on the left to see its episodes.")
-                            .color(SUBDUED),
+                            .color(subdued()),
                     );
                     return;
                 }
@@ -1266,7 +1662,12 @@ impl App {
                 .color(theme::accent()),
         );
         ui.add(
-            egui::Label::new(RichText::new(&title).font(theme::bold(26.0)).color(TEXT)).truncate(),
+            egui::Label::new(
+                RichText::new(&title)
+                    .font(theme::bold(26.0))
+                    .color(theme::text()),
+            )
+            .truncate(),
         );
         ui.horizontal(|ui| {
             let counted = if shown == count {
@@ -1274,9 +1675,9 @@ impl App {
             } else {
                 format!("{shown} of {count} {noun}{owner}")
             };
-            ui.label(RichText::new(counted).color(SUBDUED));
+            ui.label(RichText::new(counted).color(subdued()));
             if view.loading {
-                ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
+                ui.add(egui::Spinner::new().size(14.0).color(subdued()));
             }
         });
         ui.add_space(6.0);
@@ -1305,27 +1706,27 @@ impl App {
                     egui::Label::new(
                         RichText::new("Double-click to play · right-click for more")
                             .small()
-                            .color(MUTED),
+                            .color(muted()),
                     )
                     .truncate(),
                 );
             });
         });
         if let Some(e) = &view.error {
-            ui.label(RichText::new(e).color(ERROR));
+            ui.label(RichText::new(e).color(theme::error()));
         }
         if menu.can_remove && count == 0 && !view.loading {
             ui.add_space(8.0);
             ui.label(
                 RichText::new("This playlist is empty. Right-click any song in the app and choose \"Add to playlist\".")
-                    .color(SUBDUED),
+                    .color(subdued()),
             );
         }
         if count > 0 && shown == 0 {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(format!("No {noun} match \u{201c}{}\u{201d}.", view.filter))
-                    .color(SUBDUED),
+                    .color(subdued()),
             );
         }
         ui.add_space(8.0);
@@ -1441,7 +1842,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(
                 Frame::new()
-                    .fill(BG)
+                    .fill(bg())
                     .inner_margin(Margin::symmetric(20, 14)),
             )
             .show(ui, |ui| {
@@ -1488,14 +1889,14 @@ impl App {
                                     self.search.query
                                 ))
                                 .font(theme::bold(20.0))
-                                .color(TEXT),
+                                .color(theme::text()),
                             );
                             if self.search.loading {
                                 ui.add(egui::Spinner::new().size(18.0).color(theme::accent()));
                             }
                         });
                         if let Some(e) = &self.search.error {
-                            ui.label(RichText::new(e).color(ERROR));
+                            ui.label(RichText::new(e).color(theme::error()));
                         }
                         let Some(results) = &self.search.results else {
                             return;
@@ -1503,7 +1904,7 @@ impl App {
 
                         section_title(ui, "Songs");
                         if results.tracks.is_empty() {
-                            ui.label(RichText::new("No songs found").color(SUBDUED));
+                            ui.label(RichText::new("No songs found").color(subdued()));
                         } else {
                             let (header, _) = ui.allocate_exact_size(
                                 vec2(ui.available_width(), widgets::HEADER_HEIGHT),
@@ -1615,12 +2016,12 @@ impl App {
         let stroke = if focused {
             Stroke::new(2.0, theme::accent())
         } else {
-            Stroke::new(1.0, BORDER)
+            Stroke::new(1.0, border())
         };
         ui.painter().rect(
             rect,
             CornerRadius::same(10),
-            RAISED,
+            raised(),
             stroke,
             egui::StrokeKind::Inside,
         );
@@ -1630,7 +2031,7 @@ impl App {
             ui.painter(),
             icon,
             Icon::Search,
-            if focused { TEXT } else { SUBDUED },
+            if focused { theme::text() } else { subdued() },
         );
         let text_rect = Rect::from_min_max(
             pos2(rect.left() + 48.0, rect.top()),
@@ -1678,13 +2079,137 @@ impl App {
         }
         let mut actions = Vec::new();
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG))
+            .frame(Frame::new().fill(bg()))
             .show(ui, |ui| {
                 actions = fun.ui(ui, &self.playlists, self.config.fun_autoplay);
             });
         self.fun = Some(fun);
         for action in actions {
             self.on_fun_action(action);
+        }
+    }
+
+    /// Your stats: listening time, top songs and artists, and when you listen.
+    fn stats_tab(&mut self, ui: &mut Ui) {
+        if self.stats.is_none() {
+            self.show_stats(stats::Period::Month);
+        }
+        let Some(view) = &self.stats else { return };
+        let mut period = view.period;
+        let mut clear = false;
+        let sum = &view.summary;
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(bg())
+                    .inner_margin(Margin::symmetric(20, 14)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Your stats")
+                                .font(theme::bold(26.0))
+                                .color(theme::text()),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            for p in stats::Period::ALL {
+                                let style = if p == period {
+                                    ButtonStyle::Accent
+                                } else {
+                                    ButtonStyle::Ghost
+                                };
+                                if widgets::button(ui, p.name(), style, 13.0).clicked() {
+                                    period = p;
+                                }
+                            }
+                        });
+                        ui.add_space(12.0);
+                        if view.plays.is_empty() || sum.plays == 0 {
+                            ui.label(
+                            RichText::new(
+                                "Nothing here yet. Play some music and come back: a song counts \
+                                 once you have listened to it for 30 seconds.",
+                            )
+                            .color(subdued()),
+                        );
+                            return;
+                        }
+
+                        // Big numbers.
+                        ui.horizontal_wrapped(|ui| {
+                            let tiles = [
+                                (stats::format_duration(sum.total_ms), "listening"),
+                                (sum.plays.to_string(), "songs played"),
+                                (sum.songs.to_string(), "different songs"),
+                                (sum.artists.to_string(), "different artists"),
+                            ];
+                            for (number, label) in tiles {
+                                stat_tile(ui, &number, label);
+                            }
+                        });
+                        ui.add_space(14.0);
+
+                        ui.columns(2, |cols| {
+                            section_title(&mut cols[0], "Top songs");
+                            ranked_list(&mut cols[0], &sum.top_songs);
+                            section_title(&mut cols[1], "Top artists");
+                            ranked_list(&mut cols[1], &sum.top_artists);
+                        });
+                        ui.add_space(10.0);
+
+                        section_title(ui, "When you listen");
+                        ui.label(RichText::new("By hour of the day").small().color(muted()));
+                        let hours: Vec<(String, u64)> = sum
+                            .by_hour
+                            .iter()
+                            .enumerate()
+                            .map(|(h, ms)| {
+                                (
+                                    if h % 3 == 0 {
+                                        h.to_string()
+                                    } else {
+                                        String::new()
+                                    },
+                                    *ms,
+                                )
+                            })
+                            .collect();
+                        bar_chart(ui, &hours, 110.0);
+                        ui.add_space(10.0);
+                        let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+                        let weekdays: Vec<(String, u64)> = days
+                            .iter()
+                            .zip(sum.by_weekday)
+                            .map(|(d, ms)| (d.to_string(), ms))
+                            .collect();
+                        bar_chart(ui, &weekdays, 90.0);
+                        ui.add_space(16.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                            RichText::new(
+                                "Your history is kept only on this computer, in history.jsonl in \
+                                 the settings folder.",
+                            )
+                            .small()
+                            .color(muted()),
+                        );
+                            if widgets::button(ui, "Clear history", ButtonStyle::Ghost, 12.0)
+                                .clicked()
+                            {
+                                clear = true;
+                            }
+                        });
+                    });
+            });
+        if clear {
+            stats::clear();
+            self.stats = None;
+            self.show_stats(period);
+            self.notify("Your listening history is cleared.");
+        } else if period != view.period {
+            self.show_stats(period);
         }
     }
 
@@ -1697,36 +2222,79 @@ impl App {
         let mut retry = false;
         let mut relogin = false;
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(20, 14)))
+            .frame(Frame::new().fill(bg()).inner_margin(Margin::symmetric(20, 14)))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     ui.set_max_width(640.0);
-                    ui.label(RichText::new("Settings").font(theme::bold(26.0)).color(TEXT));
+                    ui.label(RichText::new("Settings").font(theme::bold(26.0)).color(theme::text()));
                     ui.add_space(10.0);
 
                     settings_card(ui, "Look", |ui| {
-                        ui.label(RichText::new("Accent colour").color(SUBDUED));
                         ui.horizontal(|ui| {
-                            for (name, color) in theme::ACCENTS {
+                            for (light, name) in [(false, "Dark"), (true, "Light")] {
+                                let style = if self.config.light_theme == light {
+                                    ButtonStyle::Accent
+                                } else {
+                                    ButtonStyle::Ghost
+                                };
+                                if widgets::button(ui, name, style, 13.0).clicked() {
+                                    self.config.light_theme = light;
+                                    theme::set_light(&ctx, light);
+                                    self.config.save();
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Accent colour").color(subdued()));
+                        ui.horizontal_wrapped(|ui| {
+                            let swatches = theme::ACCENTS
+                                .iter()
+                                .map(|(n, c)| (*n, Some(*c)))
+                                .chain([(theme::ALBUM_ACCENT, None)]);
+                            for (name, color) in swatches {
                                 let selected = self.config.accent == name;
                                 let (rect, response) =
                                     ui.allocate_exact_size(vec2(64.0, 58.0), Sense::click());
                                 let center = pos2(rect.center().x, rect.top() + 18.0);
                                 if selected {
-                                    ui.painter().circle_stroke(center, 18.0, Stroke::new(2.0, TEXT));
+                                    ui.painter().circle_stroke(center, 18.0, Stroke::new(2.0, theme::text()));
                                 }
                                 let r = if response.hovered() { 15.0 } else { 14.0 };
-                                ui.painter().circle_filled(center, r, color);
+                                match color {
+                                    Some(color) => {
+                                        ui.painter().circle_filled(center, r, color);
+                                    }
+                                    None => {
+                                        // A little colour wheel for "the cover's colour".
+                                        for (i, (_, c)) in theme::ACCENTS.iter().enumerate() {
+                                            let a0 = i as f32 / 5.0 * std::f32::consts::TAU;
+                                            let a1 = (i + 1) as f32 / 5.0 * std::f32::consts::TAU;
+                                            let points = std::iter::once(center)
+                                                .chain((0..=6).map(|k| {
+                                                    let a = a0 + (a1 - a0) * k as f32 / 6.0;
+                                                    center + r * vec2(a.cos(), a.sin())
+                                                }))
+                                                .collect();
+                                            ui.painter().add(egui::Shape::convex_polygon(points, *c, Stroke::NONE));
+                                        }
+                                    }
+                                }
                                 ui.painter().text(
                                     pos2(rect.center().x, rect.bottom() - 8.0),
                                     egui::Align2::CENTER_CENTER,
                                     name,
                                     theme::regular(12.0),
-                                    if selected { TEXT } else { SUBDUED },
+                                    if selected { theme::text() } else { subdued() },
                                 );
+                                let response = if color.is_none() {
+                                    response.on_hover_text("Takes its colour from the cover of the song that is playing")
+                                } else {
+                                    response
+                                };
                                 if response.clicked() {
                                     self.config.accent = name.to_string();
                                     theme::set_accent(&ctx, name);
+                                    self.apply_album_accent(&ctx);
                                     self.config.save();
                                 }
                             }
@@ -1742,7 +2310,7 @@ impl App {
                                  is turned off they use none at all.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(muted()),
                         );
                         ui.add_space(6.0);
                         if ui
@@ -1765,8 +2333,8 @@ impl App {
                             PlayerState::Off => "Off".to_string(),
                         };
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Player:").color(SUBDUED));
-                            ui.label(RichText::new(status).color(TEXT));
+                            ui.label(RichText::new("Player:").color(subdued()));
+                            ui.label(RichText::new(status).color(theme::text()));
                             if matches!(self.player_state, PlayerState::Failed(_))
                                 && widgets::button(ui, "Retry", ButtonStyle::Ghost, 13.0).clicked()
                             {
@@ -1776,7 +2344,7 @@ impl App {
                         ui.label(
                             RichText::new("Music streams at 320 kbit/s, the best quality Spotify offers. Nothing is saved to disk.")
                                 .small()
-                                .color(MUTED),
+                                .color(muted()),
                         );
                         ui.add_space(6.0);
                         if ui
@@ -1794,7 +2362,7 @@ impl App {
                                  in the same style from Spotify's radio and shuffles them.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(muted()),
                         );
                         ui.add_space(6.0);
                         if ui
@@ -1812,15 +2380,35 @@ impl App {
                                  Press play to carry on.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(muted()),
                         );
+                        if self.tray.is_some() {
+                            ui.add_space(6.0);
+                            if ui
+                                .checkbox(
+                                    &mut self.config.close_to_tray,
+                                    "Keep playing in the notification area when I close the window",
+                                )
+                                .changed()
+                            {
+                                self.config.save();
+                            }
+                            ui.label(
+                                RichText::new(
+                                    "Click the lite-spotify icon next to the clock to bring the window \
+                                     back; right-click it for play/pause, next and Quit.",
+                                )
+                                .small()
+                                .color(muted()),
+                            );
+                        }
                     });
 
                     settings_card(ui, "Keyboard shortcuts", |ui| {
                         egui::Grid::new("shortcuts").num_columns(2).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
                             for (keys, what) in SHORTCUTS {
-                                ui.label(RichText::new(keys).font(theme::bold(13.0)).color(TEXT));
-                                ui.label(RichText::new(what).color(SUBDUED));
+                                ui.label(RichText::new(keys).font(theme::bold(13.0)).color(theme::text()));
+                                ui.label(RichText::new(what).color(subdued()));
                                 ui.end_row();
                             }
                         });
@@ -1831,7 +2419,7 @@ impl App {
                                  and Windows shows the song in its media popup next to the volume.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(muted()),
                         );
                     });
 
@@ -1841,13 +2429,13 @@ impl App {
                         } else {
                             format!("Signed in as {}", self.user_name)
                         };
-                        ui.label(RichText::new(who).color(TEXT));
+                        ui.label(RichText::new(who).color(theme::text()));
                         if !self.can_edit_playlists && !self.user_id.is_empty() {
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     RichText::new("To make playlists and save songs to Liked Songs, sign in once more.")
-                                        .color(SUBDUED),
+                                        .color(subdued()),
                                 );
                                 if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 13.0).clicked() {
                                     relogin = true;
@@ -1871,7 +2459,7 @@ impl App {
                     settings_card(ui, "About", |ui| {
                         ui.label(
                             RichText::new(concat!("lite-spotify ", env!("CARGO_PKG_VERSION")))
-                                .color(TEXT),
+                                .color(theme::text()),
                         );
                         if ui
                             .checkbox(
@@ -1885,12 +2473,12 @@ impl App {
                         ui.label(
                             RichText::new("Looks on GitHub once when the app starts. Nothing about you is sent.")
                                 .small()
-                                .color(MUTED),
+                                .color(muted()),
                         );
                         ui.label(
                             RichText::new(format!("Settings and log file: {}", config::app_dir().display()))
                                 .small()
-                                .color(MUTED),
+                                .color(muted()),
                         );
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
@@ -1905,7 +2493,7 @@ impl App {
                         ui.label(
                             RichText::new("Uses the Inter font by Rasmus Andersson (SIL Open Font License).")
                                 .small()
-                                .color(MUTED),
+                                .color(muted()),
                         );
                     });
                 });
@@ -1961,16 +2549,16 @@ impl App {
         let modal = egui::Modal::new(egui::Id::unique("dialog"))
             .frame(
                 Frame::new()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(surface())
+                    .stroke(Stroke::new(1.0, border()))
                     .corner_radius(12)
                     .inner_margin(Margin::same(22)),
             )
             .show(ctx, |ui| {
                 ui.set_width(380.0);
-                ui.label(RichText::new(title).font(theme::bold(20.0)).color(TEXT));
+                ui.label(RichText::new(title).font(theme::bold(20.0)).color(theme::text()));
                 if let Some(subtitle) = subtitle {
-                    ui.add(egui::Label::new(RichText::new(subtitle).color(SUBDUED)).truncate());
+                    ui.add(egui::Label::new(RichText::new(subtitle).color(subdued())).truncate());
                 }
                 ui.add_space(10.0);
                 match dialog {
@@ -2010,7 +2598,7 @@ impl App {
                                 "To make playlists and save songs to Liked Songs, lite-spotify needs \
                                  one more permission from Spotify. Sign in again; it only takes a moment.",
                             )
-                            .color(SUBDUED),
+                            .color(subdued()),
                         );
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
@@ -2058,12 +2646,12 @@ impl App {
             .interactable(true)
             .show(ctx, |ui| {
                 let response = Frame::new()
-                    .fill(RAISED)
+                    .fill(raised())
                     .stroke(Stroke::new(1.0, theme::accent()))
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(16, 10))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(text).color(TEXT));
+                        ui.label(RichText::new(text).color(theme::text()));
                     })
                     .response;
                 if response.interact(Sense::click()).clicked() {
@@ -2079,9 +2667,9 @@ fn tab_button(ui: &mut Ui, label: &str, selected: bool, bar_bottom: f32) -> egui
             .layout_no_wrap(label.to_string(), theme::bold(14.0), Color32::PLACEHOLDER);
     let (rect, response) = ui.allocate_exact_size(galley.size() + vec2(20.0, 20.0), Sense::click());
     let color = if selected || response.hovered() {
-        TEXT
+        theme::text()
     } else {
-        SUBDUED
+        subdued()
     };
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
@@ -2109,7 +2697,7 @@ fn step(ui: &mut Ui, number: u32, add_contents: impl FnOnce(&mut Ui)) {
             egui::Align2::CENTER_CENTER,
             number.to_string(),
             theme::bold(13.0),
-            theme::ON_ACCENT,
+            theme::on_accent(),
         );
         ui.add_space(4.0);
         add_contents(ui);
@@ -2144,7 +2732,7 @@ fn mood_chip(ui: &mut Ui, text: &str) -> egui::Response {
         egui::Align2::LEFT_TOP,
         text,
         theme::bold(16.0),
-        TEXT,
+        Color32::WHITE,
     );
     response
 }
@@ -2164,18 +2752,136 @@ fn filter_box(ui: &mut Ui, filter: &mut String, width: f32) {
             .desired_width(width),
     );
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-    widgets::paint_icon(ui.painter(), rect, Icon::Search, SUBDUED);
+    widgets::paint_icon(ui.painter(), rect, Icon::Search, subdued());
+}
+
+/// A big number with a label under it, on the Stats tab.
+fn stat_tile(ui: &mut Ui, number: &str, label: &str) {
+    Frame::new()
+        .fill(surface())
+        .stroke(Stroke::new(1.0, border()))
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(18, 12))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_min_width(130.0);
+                ui.label(
+                    RichText::new(number)
+                        .font(theme::bold(24.0))
+                        .color(theme::accent()),
+                );
+                ui.label(RichText::new(label).color(subdued()));
+            });
+        });
+}
+
+/// Numbered top-10 list with a bar for how often each was played.
+fn ranked_list(ui: &mut Ui, list: &[crate::stats::Ranked]) {
+    let most = list.first().map_or(1, |r| r.plays.max(1));
+    for (i, item) in list.iter().enumerate() {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+        let bar_w = (rect.width() - 40.0) * item.plays as f32 / most as f32;
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min + vec2(36.0, 3.0), vec2(bar_w, rect.height() - 6.0)),
+            CornerRadius::same(6),
+            theme::accent_soft(),
+        );
+        ui.painter().text(
+            pos2(rect.left() + 16.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            (i + 1).to_string(),
+            theme::bold(14.0),
+            if i < 3 { theme::accent() } else { muted() },
+        );
+        let text = Rect::from_min_max(
+            pos2(rect.left() + 44.0, rect.top() + 3.0),
+            pos2(rect.right() - 70.0, rect.bottom() - 3.0),
+        );
+        widgets::place(
+            ui,
+            egui::UiBuilder::new()
+                .max_rect(text)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add(egui::Label::new(RichText::new(&item.name).color(theme::text())).truncate());
+                if !item.detail.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(&item.detail).small().color(subdued()))
+                            .truncate(),
+                    );
+                }
+            },
+        );
+        let times = if item.plays == 1 {
+            "1 play".to_string()
+        } else {
+            format!("{} plays", item.plays)
+        };
+        ui.painter().text(
+            pos2(rect.right() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            times,
+            theme::regular(12.0),
+            subdued(),
+        );
+    }
+}
+
+/// Simple bars with labels underneath; the values are listening times.
+fn bar_chart(ui: &mut Ui, bars: &[(String, u64)], height: f32) {
+    let width = ui.available_width().min(760.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height + 18.0), Sense::hover());
+    let most = bars.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
+    let slot = rect.width() / bars.len() as f32;
+    let hover = ui.ctx().pointer_hover_pos();
+    for (i, (label, value)) in bars.iter().enumerate() {
+        let x = rect.left() + slot * i as f32;
+        let h = (height - 4.0) * *value as f32 / most as f32;
+        let bar = Rect::from_min_max(
+            pos2(x + slot * 0.15, rect.top() + height - h.max(2.0)),
+            pos2(x + slot * 0.85, rect.top() + height),
+        );
+        let column = Rect::from_min_max(pos2(x, rect.top()), pos2(x + slot, rect.top() + height));
+        let hovered = hover.is_some_and(|p| column.contains(p));
+        let color = if hovered {
+            theme::accent()
+        } else {
+            theme::accent().gamma_multiply(0.7)
+        };
+        ui.painter().rect_filled(bar, CornerRadius::same(3), color);
+        ui.painter().text(
+            pos2(x + slot / 2.0, rect.top() + height + 9.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            theme::regular(11.0),
+            muted(),
+        );
+        if hovered && *value > 0 {
+            ui.painter().text(
+                pos2(x + slot / 2.0, bar.top() - 8.0),
+                egui::Align2::CENTER_CENTER,
+                crate::stats::format_duration(*value),
+                theme::bold(11.0),
+                theme::text(),
+            );
+        }
+    }
 }
 
 fn section_title(ui: &mut Ui, text: &str) {
     ui.add_space(10.0);
-    ui.label(RichText::new(text).font(theme::bold(18.0)).color(TEXT));
+    ui.label(
+        RichText::new(text)
+            .font(theme::bold(18.0))
+            .color(theme::text()),
+    );
     ui.add_space(4.0);
 }
 
 fn empty_hint(ui: &mut Ui, empty: bool, text: &str) {
     if empty {
-        ui.label(RichText::new(text).color(SUBDUED));
+        ui.label(RichText::new(text).color(subdued()));
     }
 }
 
@@ -2183,7 +2889,8 @@ fn empty_hint(ui: &mut Ui, empty: bool, text: &str) {
 fn result_row(ui: &mut Ui, icon: Icon, title: &str, subtitle: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(6), HOVER);
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(6), hover());
     }
     let tile = Rect::from_min_size(rect.min + vec2(6.0, 6.0), Vec2::splat(36.0));
     widgets::paint_cover(ui, tile, None, icon, 6);
@@ -2198,8 +2905,8 @@ fn result_row(ui: &mut Ui, icon: Icon, title: &str, subtitle: &str) -> egui::Res
             .layout(Layout::top_down(Align::Min)),
         |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            ui.add(egui::Label::new(RichText::new(title).color(TEXT)).truncate());
-            ui.add(egui::Label::new(RichText::new(subtitle).small().color(SUBDUED)).truncate());
+            ui.add(egui::Label::new(RichText::new(title).color(theme::text())).truncate());
+            ui.add(egui::Label::new(RichText::new(subtitle).small().color(subdued())).truncate());
         },
     );
     response
@@ -2207,8 +2914,8 @@ fn result_row(ui: &mut Ui, icon: Icon, title: &str, subtitle: &str) -> egui::Res
 
 fn settings_card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(surface())
+        .stroke(Stroke::new(1.0, border()))
         .corner_radius(10)
         .inner_margin(Margin::same(16))
         .outer_margin(Margin {
@@ -2219,7 +2926,11 @@ fn settings_card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).font(theme::bold(16.0)).color(TEXT));
+            ui.label(
+                RichText::new(title)
+                    .font(theme::bold(16.0))
+                    .color(theme::text()),
+            );
             ui.add_space(6.0);
             add_contents(ui);
         });

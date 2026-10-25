@@ -5,6 +5,7 @@
 
 mod claw;
 mod pickers;
+mod quiz;
 mod roulette;
 mod slots;
 
@@ -12,7 +13,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Rect, RichText, S
 use rand::seq::IndexedRandom;
 
 use crate::api::{Playlist, Track, TrackSource};
-use crate::theme::{self, MUTED, RAISED, SUBDUED, TEXT};
+use crate::theme::{self, muted, raised, subdued};
 use crate::widgets::{self, ButtonStyle, Icon};
 
 /// What the Fun tab asks the app to do.
@@ -27,10 +28,20 @@ pub enum FunAction {
     MakeSurpriseMix,
     /// Save these songs as a new playlist with this name.
     SaveAsPlaylist(String, Vec<Track>),
+    /// Guess the Song: play a few seconds of `track` without showing it.
+    QuizPlay {
+        track: Track,
+        start_ms: u32,
+        length_ms: u32,
+    },
+    /// The quiz is over: bring back what was playing before.
+    QuizEnd,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Game {
+    Daily,
+    Guess,
     Roulette,
     Claw,
     Slots,
@@ -42,7 +53,9 @@ enum Game {
 }
 
 impl Game {
-    const ALL: [Game; 8] = [
+    const ALL: [Game; 10] = [
+        Game::Daily,
+        Game::Guess,
         Game::Roulette,
         Game::Claw,
         Game::Slots,
@@ -55,6 +68,8 @@ impl Game {
 
     fn name(self) -> &'static str {
         match self {
+            Game::Daily => "Daily Pick",
+            Game::Guess => "Guess the Song",
             Game::Roulette => "Song Roulette",
             Game::Claw => "Claw Machine",
             Game::Slots => "Slot Machine",
@@ -68,6 +83,8 @@ impl Game {
 
     fn blurb(self) -> &'static str {
         match self {
+            Game::Daily => "One song from your list, a new one every day.",
+            Game::Guess => "Hear a few seconds of a song from your list. Which one is it?",
             Game::Roulette => "Spin the wheel. Wherever the ball lands, that's your song.",
             Game::Claw => "Steer the claw, drop it and try to grab a prize. It slips sometimes!",
             Game::Slots => "Pull the lever for a line-up of three songs.",
@@ -110,6 +127,8 @@ pub struct Fun {
     cards: pickers::Cards,
     duel: pickers::Duel,
     time_machine: pickers::TimeMachine,
+    quiz: quiz::Quiz,
+    daily: pickers::Daily,
 }
 
 impl Fun {
@@ -130,6 +149,8 @@ impl Fun {
             cards: pickers::Cards::default(),
             duel: pickers::Duel::default(),
             time_machine: pickers::TimeMachine,
+            quiz: quiz::Quiz::default(),
+            daily: pickers::Daily::default(),
         }
     }
 
@@ -144,6 +165,8 @@ impl Fun {
             "time" => Game::TimeMachine,
             "rediscover" => Game::Rediscover,
             "mix" => Game::SurpriseMix,
+            "guess" => Game::Guess,
+            "daily" => Game::Daily,
             _ => Game::Roulette,
         };
     }
@@ -159,6 +182,16 @@ impl Fun {
 
     pub fn pool_source(&self) -> &TrackSource {
         &self.pool_source
+    }
+
+    /// The quiz snippet started playing.
+    pub fn quiz_started(&mut self) {
+        self.quiz.started();
+    }
+
+    /// The quiz snippet could not be played.
+    pub fn quiz_unavailable(&mut self) {
+        self.quiz.unavailable();
     }
 
     /// Called by the app when it starts loading a new pool.
@@ -235,14 +268,17 @@ impl Fun {
                 ui.label(
                     RichText::new("Can't decide?")
                         .font(theme::bold(18.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
-                ui.label(RichText::new("Let a game pick for you.").color(SUBDUED));
+                ui.label(RichText::new("Let a game pick for you.").color(subdued()));
                 ui.add_space(10.0);
                 for game in Game::ALL {
                     let selected = self.game == game;
                     if widgets::nav_row(ui, game_icon(game), game.name(), selected, false).clicked()
                     {
+                        if self.game == Game::Guess && game != Game::Guess {
+                            actions.push(FunAction::QuizEnd);
+                        }
                         self.game = game;
                         self.pick = None;
                     }
@@ -252,7 +288,7 @@ impl Fun {
         ui.painter().vline(
             menu.right(),
             menu.y_range(),
-            egui::Stroke::new(1.0, theme::BORDER),
+            egui::Stroke::new(1.0, theme::border()),
         );
 
         // Right: the game.
@@ -269,9 +305,9 @@ impl Fun {
                 ui.label(
                     RichText::new(self.game.name())
                         .font(theme::bold(24.0))
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
-                ui.label(RichText::new(self.game.blurb()).color(SUBDUED));
+                ui.label(RichText::new(self.game.blurb()).color(subdued()));
                 ui.add_space(8.0);
                 if self.game.uses_pool() {
                     self.pool_picker(ui, playlists, &mut actions);
@@ -308,7 +344,7 @@ impl Fun {
 
     fn pool_picker(&mut self, ui: &mut Ui, playlists: &[Playlist], actions: &mut Vec<FunAction>) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Songs from").color(SUBDUED));
+            ui.label(RichText::new("Songs from").color(subdued()));
             let current = source_name(&self.pool_source);
             egui::ComboBox::from_id_salt("fun-pool")
                 .selected_text(current)
@@ -335,14 +371,16 @@ impl Fun {
                     }
                 });
             if self.pool_loading {
-                ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
-                ui.label(RichText::new(format!("{} songs so far…", self.pool.len())).color(MUTED));
+                ui.add(egui::Spinner::new().size(14.0).color(subdued()));
+                ui.label(
+                    RichText::new(format!("{} songs so far…", self.pool.len())).color(muted()),
+                );
             } else if !self.pool.is_empty() {
-                ui.label(RichText::new(format!("{} songs", self.pool.len())).color(MUTED));
+                ui.label(RichText::new(format!("{} songs", self.pool.len())).color(muted()));
             }
         });
         if let Some(e) = &self.pool_error {
-            ui.label(RichText::new(e).color(theme::ERROR));
+            ui.label(RichText::new(e).color(theme::error()));
         }
     }
 
@@ -363,7 +401,7 @@ impl Fun {
             if !self.pool_loading {
                 ui.add_space(20.0);
                 ui.label(
-                    RichText::new("Pick a list with a few songs in it to play.").color(SUBDUED),
+                    RichText::new("Pick a list with a few songs in it to play.").color(subdued()),
                 );
             } else {
                 ui.add_space(20.0);
@@ -382,6 +420,8 @@ impl Fun {
             Game::TimeMachine => self.time_machine.ui(ui, pool),
             Game::Rediscover => pickers::rediscover_ui(ui, pool),
             Game::SurpriseMix => None,
+            Game::Guess => self.quiz.ui(ui, pool, version, actions),
+            Game::Daily => self.daily.ui(ui, pool),
         }
     }
 
@@ -391,7 +431,7 @@ impl Fun {
         ui.painter().rect(
             rect,
             CornerRadius::same(10),
-            RAISED,
+            raised(),
             egui::Stroke::new(1.5, theme::accent()),
             egui::StrokeKind::Inside,
         );
@@ -416,10 +456,14 @@ impl Fun {
                     format!("{} + {} more", first.name, pick.tracks.len() - 1)
                 };
                 ui.add(
-                    egui::Label::new(RichText::new(text).font(theme::bold(16.0)).color(TEXT))
-                        .truncate(),
+                    egui::Label::new(
+                        RichText::new(text)
+                            .font(theme::bold(16.0))
+                            .color(theme::text()),
+                    )
+                    .truncate(),
                 );
-                ui.add(egui::Label::new(RichText::new(&first.artists).color(SUBDUED)).truncate());
+                ui.add(egui::Label::new(RichText::new(&first.artists).color(subdued())).truncate());
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if widgets::icon_button(ui, Icon::Close, 12.0, true, false)
@@ -453,10 +497,12 @@ impl Fun {
 
 fn game_icon(game: Game) -> Icon {
     match game {
+        Game::Daily => Icon::Heart,
+        Game::Guess => Icon::Mic,
         Game::Roulette => Icon::Disc,
         Game::Claw => Icon::Plus,
         Game::Slots => Icon::Repeat,
-        Game::Cards => Icon::Heart,
+        Game::Cards => Icon::Disc,
         Game::Duel => Icon::Shuffle,
         Game::TimeMachine => Icon::Previous,
         Game::Rediscover => Icon::Search,
@@ -499,16 +545,21 @@ fn song_card(ui: &Ui, rect: Rect, track: &Track, fill: Color32, stroke: Color32)
         egui::StrokeKind::Inside,
     );
     let inner = rect.shrink2(vec2(10.0, 8.0));
-    let title = p.layout(track.name.clone(), theme::bold(14.0), TEXT, inner.width());
+    let title = p.layout(
+        track.name.clone(),
+        theme::bold(14.0),
+        theme::text(),
+        inner.width(),
+    );
     let title_h = title.size().y.min(inner.height() * 0.66);
     let clip = p.with_clip_rect(inner);
-    clip.galley(inner.left_top(), title, TEXT);
+    clip.galley(inner.left_top(), title, theme::text());
     clip.text(
         egui::pos2(inner.left(), inner.top() + title_h + 4.0),
         egui::Align2::LEFT_TOP,
         &track.artists,
         theme::regular(12.0),
-        SUBDUED,
+        subdued(),
     );
 }
 

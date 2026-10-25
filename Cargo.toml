@@ -1,6 +1,6 @@
 [package]
 name = "lite-spotify"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Lightweight Spotify Premium player for Windows (egui + librespot)"
 license = "MIT"
@@ -42,6 +42,8 @@ url = "2"
 rand = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
+# Dates in the local time zone, for listening stats and the daily pick.
+jiff = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # The window handle, for Windows' media controls.
 raw-window-handle = "0.6"
@@ -55,6 +57,8 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_WinRT",
 ] }
+# The icon in the notification area (system tray).
+tray-icon = { version = "0.25", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -7,7 +7,7 @@ use rand::Rng;
 
 use super::{ease_out, sample};
 use crate::api::Track;
-use crate::theme::{self, MUTED, SUBDUED, TEXT};
+use crate::theme::{self, muted, subdued};
 use crate::widgets::{self, ButtonStyle};
 
 const SONGS: usize = 12;
@@ -178,7 +178,7 @@ impl Roulette {
                 ui.label(
                     RichText::new("ON THE WHEEL")
                         .font(theme::bold(12.0))
-                        .color(MUTED),
+                        .color(muted()),
                 );
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
@@ -195,15 +195,19 @@ impl Roulette {
                                     egui::Align2::CENTER_CENTER,
                                     i.to_string(),
                                     theme::bold(11.0),
-                                    TEXT,
+                                    Color32::WHITE,
                                 );
                                 let (name, color) = if i == 0 {
-                                    ("WILD: any song from the list".to_string(), SUBDUED)
+                                    ("WILD: any song from the list".to_string(), subdued())
                                 } else {
                                     let t = &self.pockets[i - 1];
                                     (
                                         format!("{} · {}", t.name, t.artists),
-                                        if winner { theme::accent() } else { TEXT },
+                                        if winner {
+                                            theme::accent()
+                                        } else {
+                                            theme::text()
+                                        },
                                     )
                                 };
                                 let color = if winner { theme::accent() } else { color };
@@ -256,7 +260,7 @@ impl Roulette {
                 egui::Align2::CENTER_CENTER,
                 label,
                 theme::bold((r * 0.09).clamp(10.0, 20.0)),
-                TEXT,
+                Color32::WHITE,
             );
         }
         p.circle_stroke(c, r * 0.84, Stroke::new(1.5, GOLD));
@@ -287,7 +291,7 @@ impl Roulette {
         p.add(Shape::convex_polygon(
             vec![tip, tip + vec2(-10.0, -22.0), tip + vec2(10.0, -22.0)],
             theme::accent(),
-            Stroke::new(1.5, theme::ON_ACCENT),
+            Stroke::new(1.5, theme::on_accent()),
         ));
 
         // The ball.
