@@ -7,17 +7,20 @@ use eframe::egui::{
 };
 use rand::Rng;
 
-use super::{App, Dialog, ListView, NOTICE_TIME, PlayerState, Screen, Tab};
+use std::time::{Duration, Instant};
+
+use super::{App, Dialog, ListView, NOTICE_TIME, PlayerState, Screen, Sleep, Tab};
 use crate::api::{Track, TrackSource};
 use crate::auth;
 use crate::config::{self, Repeat};
 use crate::theme::{self, BG, BORDER, ERROR, HOVER, MUTED, RAISED, SUBDUED, SURFACE, TEXT};
-use crate::widgets::{self, ButtonStyle, Icon, RowAction, RowMenu, format_time};
+use crate::widgets::{self, ButtonStyle, Icon, RowAction, RowMenu, RowState, format_time};
 
 /// What the user did in a song list.
 enum ListAction {
     Play(usize),
     Queue(usize),
+    Like(usize),
     PlayAll,
     ShuffleAll,
     AddTo(usize, String),
@@ -50,26 +53,43 @@ enum Which {
     Podcast,
 }
 
+/// The keyboard shortcuts, as listed in Settings.
+const SHORTCUTS: [(&str, &str); 10] = [
+    ("Space", "Play / pause"),
+    ("Ctrl + \u{2192} / \u{2190}", "Next / previous song"),
+    ("\u{2192} / \u{2190}", "Forward / back 10 seconds"),
+    ("+ / \u{2212}", "Volume up / down"),
+    ("M", "Mute"),
+    ("L", "Save the song to Liked Songs (or remove it)"),
+    ("S", "Shuffle on / off"),
+    ("R", "Repeat: off, list, song"),
+    ("Ctrl + F", "Search"),
+    ("Ctrl + 1 \u{2026} 5", "Switch tabs"),
+];
+
 impl eframe::App for App {
+    /// Runs before every frame, and also while the window is minimised, so the
+    /// next song still starts and the sleep timer still works.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_messages(ctx);
+        self.tick_sleep(ctx);
+        self.update_media_popup();
+        if self.now.playing {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_messages(&ctx);
-
         match self.screen {
             Screen::Setup { .. } => self.setup_screen(ui),
             Screen::SignIn { .. } => self.sign_in_screen(ui),
             Screen::Main => {
-                // Space toggles play/pause, unless the user is typing. The key is consumed
-                // so a focused button does not also react to it.
-                if !ctx.egui_wants_keyboard_input()
-                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Space))
-                {
-                    self.toggle_play();
-                }
+                self.keyboard_shortcuts(&ctx);
                 self.main_screen(ui);
                 // Keep the seek bar moving; otherwise only redraw when something happens.
                 if self.now.playing {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    ctx.request_repaint_after(Duration::from_millis(500));
                 }
             }
         }
@@ -77,10 +97,91 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.config.save();
+        self.save_session();
     }
 }
 
 impl App {
+    /// See [`SHORTCUTS`]. Keys are only used while the user is not typing, and
+    /// are consumed so a focused button does not also react to them.
+    fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
+            return;
+        }
+        use egui::Modifiers as M;
+        let pressed = |modifiers: M, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
+        if pressed(M::COMMAND, Key::F) {
+            self.tab = Tab::Search;
+            self.focus_search = true;
+        }
+        let tabs = [
+            (Key::Num1, Tab::Library),
+            (Key::Num2, Tab::Search),
+            (Key::Num3, Tab::Podcasts),
+            (Key::Num4, Tab::Fun),
+            (Key::Num5, Tab::Settings),
+        ];
+        for (key, tab) in tabs {
+            if pressed(M::COMMAND, key) && (tab != Tab::Fun || self.fun.is_some()) {
+                self.tab = tab;
+            }
+        }
+        if pressed(M::NONE, Key::Space) {
+            self.toggle_play();
+        }
+        let has_track = self.now.track.is_some();
+        if pressed(M::COMMAND, Key::ArrowRight) && has_track {
+            self.next();
+        }
+        if pressed(M::COMMAND, Key::ArrowLeft) && has_track {
+            self.previous();
+        }
+        // The claw machine on the Fun tab uses the arrow keys itself.
+        if self.tab != Tab::Fun {
+            if pressed(M::NONE, Key::ArrowRight) {
+                self.seek_by(10);
+            }
+            if pressed(M::NONE, Key::ArrowLeft) {
+                self.seek_by(-10);
+            }
+        }
+        let mut volume = None;
+        if pressed(M::NONE, Key::Plus) || pressed(M::NONE, Key::Equals) {
+            volume = Some((self.config.volume + 0.05).min(1.0));
+        }
+        if pressed(M::NONE, Key::Minus) {
+            volume = Some((self.config.volume - 0.05).max(0.0));
+        }
+        if pressed(M::NONE, Key::M) {
+            volume = Some(self.toggled_mute());
+        }
+        if let Some(v) = volume {
+            self.set_volume(v);
+            self.config.save();
+        }
+        if pressed(M::NONE, Key::L)
+            && let Some(track) = self.now.track.clone()
+        {
+            self.toggle_like(track);
+        }
+        if pressed(M::NONE, Key::S) {
+            self.set_shuffle(!self.config.shuffle);
+        }
+        if pressed(M::NONE, Key::R) {
+            self.cycle_repeat();
+        }
+    }
+
+    /// The volume after pressing mute: 0, or what it was before muting.
+    fn toggled_mute(&mut self) -> f32 {
+        if self.config.volume > 0.0 {
+            self.volume_before_mute = self.config.volume;
+            0.0
+        } else {
+            self.volume_before_mute.max(0.1)
+        }
+    }
+
     // ---------------------------------------------------------- first start
 
     /// A card in the middle of the window, used by the setup and sign-in screens.
@@ -340,6 +441,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG))
             .show(ui, |ui| {
+                self.update_banner(ui);
                 self.player_banner(ui);
                 match self.tab {
                     Tab::Library => self.library_tab(ui),
@@ -479,6 +581,7 @@ impl App {
 
         // Title and artist.
         let mut add_to: Option<Option<String>> = None;
+        let mut like = false;
         match &self.now.track {
             Some(t) => {
                 ui.add(
@@ -488,7 +591,28 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(&t.artists).color(SUBDUED)).truncate());
                 ui.add(egui::Label::new(RichText::new(&t.album).small().color(MUTED)).truncate());
                 ui.add_space(4.0);
-                let button = widgets::button(ui, "+ Add to playlist", ButtonStyle::Ghost, 12.0);
+                let liked = self.is_liked(&t.uri);
+                let mut button = None;
+                ui.horizontal(|ui| {
+                    let tip = if liked {
+                        "Remove from Liked Songs (L)"
+                    } else {
+                        "Save to Liked Songs (L)"
+                    };
+                    if widgets::heart_button(ui, 18.0, liked)
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        like = true;
+                    }
+                    button = Some(widgets::button(
+                        ui,
+                        "+ Add to playlist",
+                        ButtonStyle::Ghost,
+                        12.0,
+                    ));
+                });
+                let button = button.expect("set above");
                 let playlists = self.own_playlists();
                 egui::Popup::menu(&button).show(|ui| {
                     ui.set_min_width(200.0);
@@ -518,6 +642,9 @@ impl App {
                 ui.label(RichText::new(self.player_status_text()).color(SUBDUED));
                 ui.label(RichText::new(" ").small());
             }
+        }
+        if like && let Some(track) = self.now.track.clone() {
+            self.toggle_like(track);
         }
         if let (Some(target), Some(track)) = (add_to, self.now.track.clone()) {
             match target {
@@ -583,13 +710,13 @@ impl App {
             let total = 4.0 * 28.0 + 48.0 + 4.0 * 10.0;
             ui.add_space(((width - total) / 2.0).max(0.0));
             if widgets::icon_button(ui, Icon::Shuffle, 16.0, true, self.config.shuffle)
-                .on_hover_text("Shuffle")
+                .on_hover_text("Shuffle (S)")
                 .clicked()
             {
                 action = Some(0);
             }
             if widgets::icon_button(ui, Icon::Previous, 16.0, enabled, false)
-                .on_hover_text("Previous")
+                .on_hover_text("Previous (Ctrl + \u{2190})")
                 .clicked()
             {
                 action = Some(1);
@@ -601,7 +728,7 @@ impl App {
                 action = Some(2);
             }
             if widgets::icon_button(ui, Icon::Next, 16.0, enabled, false)
-                .on_hover_text("Next")
+                .on_hover_text("Next (Ctrl + \u{2192})")
                 .clicked()
             {
                 action = Some(3);
@@ -636,15 +763,11 @@ impl App {
                 _ => Icon::VolumeHigh,
             };
             if widgets::icon_button(ui, icon, 16.0, true, false)
-                .on_hover_text("Mute")
+                .on_hover_text("Mute (M)")
                 .clicked()
             {
-                if self.config.volume > 0.0 {
-                    self.volume_before_mute = self.config.volume;
-                    self.set_volume(0.0);
-                } else {
-                    self.set_volume(self.volume_before_mute.max(0.1));
-                }
+                let v = self.toggled_mute();
+                self.set_volume(v);
                 self.config.save();
             }
             let w = ui.available_width();
@@ -657,7 +780,9 @@ impl App {
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
+        self.sleep_timer_button(ui);
+        ui.add_space(8.0);
         ui.painter().hline(
             ui.max_rect().x_range(),
             ui.cursor().top(),
@@ -665,6 +790,61 @@ impl App {
         );
         ui.add_space(10.0);
         self.up_next(ui);
+    }
+
+    /// "Sleep timer" with a menu of times; shows the time left while it runs.
+    fn sleep_timer_button(&mut self, ui: &mut Ui) {
+        let label = match self.sleep {
+            None => "Sleep timer".to_string(),
+            Some(Sleep::EndOfSong) => "Sleep: after this song".to_string(),
+            Some(Sleep::At(t)) => {
+                let left = t.saturating_duration_since(Instant::now());
+                format!("Sleep in {}", format_time(left.as_millis() as u32 + 999))
+            }
+        };
+        let mut chosen: Option<Option<Sleep>> = None;
+        ui.horizontal(|ui| {
+            let button = widgets::button(ui, &label, ButtonStyle::Ghost, 12.0)
+                .on_hover_text("Pause the music after a while");
+            egui::Popup::menu(&button).show(|ui| {
+                ui.set_min_width(170.0);
+                for minutes in [15, 30, 45, 60, 90] {
+                    if ui.button(format!("In {minutes} minutes")).clicked() {
+                        let at = Instant::now() + Duration::from_secs(minutes * 60);
+                        chosen = Some(Some(Sleep::At(at)));
+                    }
+                }
+                if ui.button("After this song").clicked() {
+                    chosen = Some(Some(Sleep::EndOfSong));
+                }
+                if self.sleep.is_some() {
+                    ui.separator();
+                    if ui.button("Turn off").clicked() {
+                        chosen = Some(None);
+                    }
+                }
+            });
+            if self.sleep.is_some()
+                && widgets::icon_button(ui, Icon::Close, 10.0, true, false)
+                    .on_hover_text("Turn the sleep timer off")
+                    .clicked()
+            {
+                chosen = Some(None);
+            }
+        });
+        if let Some(sleep) = chosen {
+            self.set_sleep(sleep);
+            match sleep {
+                Some(Sleep::At(_)) => {
+                    self.notify("Sleep timer is on. The music fades out at the end.")
+                }
+                Some(Sleep::EndOfSong) => self.notify("The music stops after this song."),
+                None => self.notify("Sleep timer is off."),
+            }
+        }
+        if matches!(self.sleep, Some(Sleep::At(_))) {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
     }
 
     fn up_next(&mut self, ui: &mut Ui) {
@@ -738,6 +918,50 @@ impl App {
             PlayerState::BrowserLogin(_) => "Approve playback in your browser".into(),
             PlayerState::Ready => "Double-click a song to play it".into(),
             PlayerState::Failed(_) => "The player is not connected".into(),
+        }
+    }
+
+    /// "A new version is out", with a download button.
+    fn update_banner(&mut self, ui: &mut Ui) {
+        let Some(release) = &self.update else { return };
+        let mut close = false;
+        Frame::new()
+            .fill(theme::accent_soft())
+            .stroke(Stroke::new(1.0, theme::accent()))
+            .corner_radius(8)
+            .inner_margin(Margin::symmetric(16, 8))
+            .outer_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("lite-spotify {} is out!", release.version))
+                            .font(theme::bold(14.0))
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        RichText::new(concat!("You have ", env!("CARGO_PKG_VERSION"), "."))
+                            .color(SUBDUED),
+                    );
+                    if widgets::button(ui, "Download", ButtonStyle::Accent, 13.0)
+                        .on_hover_text("Downloads the new .exe in your browser. Close this one and start the new one; your settings and login stay.")
+                        .clicked()
+                    {
+                        let _ = open::that_detached(&release.download_url);
+                    }
+                    if widgets::button(ui, "What's new", ButtonStyle::Ghost, 13.0).clicked() {
+                        let _ = open::that_detached(&release.page_url);
+                    }
+                    if widgets::icon_button(ui, Icon::Close, 10.0, true, false)
+                        .on_hover_text("Hide until next start")
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.update = None;
         }
     }
 
@@ -987,6 +1211,8 @@ impl App {
             Some(ListAction::Play(i))
         } else if row.queue {
             Some(ListAction::Queue(i))
+        } else if row.like {
+            Some(ListAction::Like(i))
         } else if let Some(id) = row.add_to {
             Some(ListAction::AddTo(i, id))
         } else if row.new_playlist {
@@ -998,11 +1224,20 @@ impl App {
         }
     }
 
-    /// A list's title, buttons and song table.
-    fn list_view(&self, ui: &mut Ui, which: Which) -> Option<ListAction> {
+    fn view_mut(&mut self, which: Which) -> &mut ListView {
+        match which {
+            Which::Library => &mut self.library,
+            Which::Podcast => &mut self.podcast,
+        }
+    }
+
+    /// A list's title, buttons, filter box and song table.
+    fn list_view(&mut self, ui: &mut Ui, which: Which) -> Option<ListAction> {
+        self.view_mut(which).update_shown();
         let view = self.view(which);
         let source = view.source.as_ref()?;
         let count = view.tracks.len();
+        let shown = view.shown.len();
         let episodes = matches!(source, TrackSource::Show { .. });
         let (kind, title) = match source {
             TrackSource::LikedSongs => ("Your Liked Songs", "Liked Songs".to_string()),
@@ -1022,6 +1257,8 @@ impl App {
         let menu = self.row_menu(Some(source));
         let noun = if episodes { "episodes" } else { "songs" };
         let mut action = None;
+        let mut filter = view.filter.clone();
+        let mut new_sort = None;
 
         ui.label(
             RichText::new(kind.to_uppercase())
@@ -1032,14 +1269,19 @@ impl App {
             egui::Label::new(RichText::new(&title).font(theme::bold(26.0)).color(TEXT)).truncate(),
         );
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{count} {noun}{owner}")).color(SUBDUED));
+            let counted = if shown == count {
+                format!("{count} {noun}{owner}")
+            } else {
+                format!("{shown} of {count} {noun}{owner}")
+            };
+            ui.label(RichText::new(counted).color(SUBDUED));
             if view.loading {
                 ui.add(egui::Spinner::new().size(14.0).color(SUBDUED));
             }
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(count > 0, |ui| {
+            ui.add_enabled_ui(shown > 0, |ui| {
                 if widgets::button(ui, "Play", ButtonStyle::Accent, 14.0).clicked() {
                     action = Some(ListAction::PlayAll);
                 }
@@ -1053,14 +1295,21 @@ impl App {
             {
                 action = Some(ListAction::Rename);
             }
-            ui.add(
-                egui::Label::new(
-                    RichText::new("Double-click to play · right-click for more")
-                        .small()
-                        .color(MUTED),
-                )
-                .truncate(),
-            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                filter_box(
+                    ui,
+                    &mut filter,
+                    (ui.available_width() * 0.5).clamp(120.0, 240.0),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Double-click to play · right-click for more")
+                            .small()
+                            .color(MUTED),
+                    )
+                    .truncate(),
+                );
+            });
         });
         if let Some(e) = &view.error {
             ui.label(RichText::new(e).color(ERROR));
@@ -1069,6 +1318,13 @@ impl App {
             ui.add_space(8.0);
             ui.label(
                 RichText::new("This playlist is empty. Right-click any song in the app and choose \"Add to playlist\".")
+                    .color(SUBDUED),
+            );
+        }
+        if count > 0 && shown == 0 {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!("No {noun} match \u{201c}{}\u{201d}.", view.filter))
                     .color(SUBDUED),
             );
         }
@@ -1083,37 +1339,44 @@ impl App {
             vec2(ui.available_width(), widgets::HEADER_HEIGHT),
             Sense::hover(),
         );
-        widgets::table_header(ui, header, labels);
+        if let Some(sort) = widgets::sortable_header(ui, header, labels, view.sort) {
+            new_sort = Some(sort);
+        }
         ui.add_space(4.0);
         let current = self.now.track.as_ref().map(|t| t.uri.as_str());
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(
             ui,
             widgets::ROW_HEIGHT,
-            count,
+            shown,
             |ui, range| {
-                for i in range {
+                for row_index in range {
+                    let i = view.shown[row_index];
                     let t = &view.tracks[i];
                     let (rect, _) = ui.allocate_exact_size(
                         vec2(ui.available_width(), widgets::ROW_HEIGHT),
                         Sense::hover(),
                     );
                     let is_current = current == Some(t.uri.as_str());
-                    let row = widgets::table_row(
-                        ui,
-                        rect,
-                        i + 1,
-                        t,
+                    let state = RowState {
                         is_current,
-                        is_current && self.now.playing,
-                        &menu,
-                    );
-                    if let Some(a) = Self::row_to_action(row, i) {
+                        is_playing: is_current && self.now.playing,
+                        liked: self.is_liked(&t.uri),
+                    };
+                    let row = widgets::table_row(ui, rect, i + 1, t, state, &menu);
+                    if let Some(a) = Self::row_to_action(row, row_index) {
                         action = Some(a);
                     }
                 }
             },
         );
+        let view = self.view_mut(which);
+        if filter != view.filter {
+            view.filter = filter;
+        }
+        if let Some(sort) = new_sort {
+            view.sort = sort;
+        }
         action
     }
 
@@ -1127,6 +1390,7 @@ impl App {
         match action {
             ListAction::Play(i) => self.play_list(tracks, i, source),
             ListAction::Queue(i) => self.add_to_queue(vec![tracks[i].clone()]),
+            ListAction::Like(i) => self.toggle_like(tracks[i].clone()),
             ListAction::PlayAll => self.play_list(tracks, 0, source),
             ListAction::ShuffleAll => {
                 if !self.config.shuffle {
@@ -1162,7 +1426,8 @@ impl App {
 
     fn apply_list_action(&mut self, which: Which, action: ListAction) {
         let view = self.view(which);
-        let tracks = view.tracks.clone();
+        // Play in the order shown, and only the songs that match the filter.
+        let tracks = view.shown_tracks();
         let source = view.source.clone();
         self.apply_action(tracks, source, action);
     }
@@ -1255,15 +1520,12 @@ impl App {
                                         Sense::hover(),
                                     );
                                     let is_current = current == Some(t.uri.as_str());
-                                    let row = widgets::table_row(
-                                        ui,
-                                        rect,
-                                        i + 1,
-                                        t,
+                                    let state = RowState {
                                         is_current,
-                                        is_current && self.now.playing,
-                                        &menu,
-                                    );
+                                        is_playing: is_current && self.now.playing,
+                                        liked: self.is_liked(&t.uri),
+                                    };
+                                    let row = widgets::table_row(ui, rect, i + 1, t, state, &menu);
                                     if let Some(a) = Self::row_to_action(row, i) {
                                         action = Some(a);
                                     }
@@ -1534,6 +1796,43 @@ impl App {
                             .small()
                             .color(MUTED),
                         );
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(
+                                &mut self.config.resume_session,
+                                "Continue where I left off when the app starts",
+                            )
+                            .changed()
+                        {
+                            self.config.save();
+                        }
+                        ui.label(
+                            RichText::new(
+                                "The song you were listening to and the queue come back, paused. \
+                                 Press play to carry on.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+
+                    settings_card(ui, "Keyboard shortcuts", |ui| {
+                        egui::Grid::new("shortcuts").num_columns(2).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
+                            for (keys, what) in SHORTCUTS {
+                                ui.label(RichText::new(keys).font(theme::bold(13.0)).color(TEXT));
+                                ui.label(RichText::new(what).color(SUBDUED));
+                                ui.end_row();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "The play, pause, next and previous keys on your keyboard work too, \
+                                 and Windows shows the song in its media popup next to the volume.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
                     });
 
                     settings_card(ui, "Account", |ui| {
@@ -1547,7 +1846,7 @@ impl App {
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new("To make and change playlists, sign in once more.")
+                                    RichText::new("To make playlists and save songs to Liked Songs, sign in once more.")
                                         .color(SUBDUED),
                                 );
                                 if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 13.0).clicked() {
@@ -1573,6 +1872,20 @@ impl App {
                         ui.label(
                             RichText::new(concat!("lite-spotify ", env!("CARGO_PKG_VERSION")))
                                 .color(TEXT),
+                        );
+                        if ui
+                            .checkbox(
+                                &mut self.config.check_updates,
+                                "Tell me when a new version is out",
+                            )
+                            .changed()
+                        {
+                            self.config.save();
+                        }
+                        ui.label(
+                            RichText::new("Looks on GitHub once when the app starts. Nothing about you is sent.")
+                                .small()
+                                .color(MUTED),
                         );
                         ui.label(
                             RichText::new(format!("Settings and log file: {}", config::app_dir().display()))
@@ -1694,8 +2007,8 @@ impl App {
                     Dialog::NeedsLogin => {
                         ui.label(
                             RichText::new(
-                                "To make and change playlists, lite-spotify needs one more permission \
-                                 from Spotify. Sign in again; it only takes a moment.",
+                                "To make playlists and save songs to Liked Songs, lite-spotify needs \
+                                 one more permission from Spotify. Sign in again; it only takes a moment.",
                             )
                             .color(SUBDUED),
                         );
@@ -1834,6 +2147,24 @@ fn mood_chip(ui: &mut Ui, text: &str) -> egui::Response {
         TEXT,
     );
     response
+}
+
+/// A small text box that filters a song list as you type.
+fn filter_box(ui: &mut Ui, filter: &mut String, width: f32) {
+    if !filter.is_empty()
+        && widgets::icon_button(ui, Icon::Close, 9.0, true, false)
+            .on_hover_text("Clear the filter")
+            .clicked()
+    {
+        filter.clear();
+    }
+    ui.add(
+        egui::TextEdit::singleline(filter)
+            .hint_text("Filter this list")
+            .desired_width(width),
+    );
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+    widgets::paint_icon(ui.painter(), rect, Icon::Search, SUBDUED);
 }
 
 fn section_title(ui: &mut Ui, text: &str) {

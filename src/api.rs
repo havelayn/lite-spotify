@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -18,7 +18,8 @@ const MAX_TRACKS: usize = 10_000;
 const SEARCH_LIMIT: &str = "10";
 
 /// A song or podcast episode as the UI shows it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Track {
     pub uri: String,
     pub name: String,
@@ -79,7 +80,7 @@ pub struct SearchResults {
 }
 
 /// Where a list of tracks comes from.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TrackSource {
     LikedSongs,
     Playlist {
@@ -245,12 +246,35 @@ impl WebApi {
         })
     }
 
-    /// Whether the login allows changing playlists (logins from before 0.4.0 don't).
-    pub async fn can_edit_playlists(&self) -> bool {
+    /// Whether the login allows changing playlists and Liked Songs (logins from
+    /// older versions don't).
+    pub async fn can_edit(&self) -> bool {
         let tokens = self.tokens.lock().await;
-        auth::PLAYLIST_EDIT_SCOPES
+        auth::EDIT_SCOPES
             .iter()
             .all(|s| tokens.scope.split(' ').any(|g| g == *s))
+    }
+
+    /// Adds songs or episodes to Liked Songs (`like`) or removes them.
+    pub async fn set_liked(&self, uris: &[String], like: bool) -> Result<()> {
+        let method = if like {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::DELETE
+        };
+        // At most 40 per request; the list goes in the address, not the body.
+        for chunk in uris.chunks(40) {
+            let list = chunk.join(",");
+            self.request(method.clone(), "/me/library", &[("uris", &list)], None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether each of `uris` (at most 40) is in Liked Songs.
+    pub async fn liked(&self, uris: &[String]) -> Result<Vec<bool>> {
+        let list = uris.join(",");
+        self.get("/me/library/contains", &[("uris", &list)]).await
     }
 
     /// Makes a new private playlist.

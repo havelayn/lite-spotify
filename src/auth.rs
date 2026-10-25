@@ -27,12 +27,18 @@ pub const WEB_SCOPES: &[&str] = &[
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
+    "user-library-modify",
     "playlist-modify-private",
     "playlist-modify-public",
 ];
 
-/// Needed to make and change playlists. Logins from versions before 0.4.0 lack them.
-pub const PLAYLIST_EDIT_SCOPES: &[&str] = &["playlist-modify-private", "playlist-modify-public"];
+/// Needed to make and change playlists and Liked Songs. Logins from older
+/// versions lack some of them.
+pub const EDIT_SCOPES: &[&str] = &[
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "user-library-modify",
+];
 
 /// Spotify only lets its own client ID log in to the audio servers, so the
 /// player logs in with the ID librespot uses, on the redirect URI registered for it.

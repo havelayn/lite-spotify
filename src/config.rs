@@ -28,6 +28,10 @@ pub struct Config {
     pub autoplay_similar: bool,
     /// The last few searches, newest first.
     pub recent_searches: Vec<String>,
+    /// On start, load the song (and queue) that was playing when the app was closed.
+    pub resume_session: bool,
+    /// Look for a newer version on GitHub when the app starts.
+    pub check_updates: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -53,6 +57,8 @@ impl Default for Config {
             repeat: Repeat::Off,
             autoplay_similar: true,
             recent_searches: Vec::new(),
+            resume_session: true,
+            check_updates: true,
         }
     }
 }
@@ -72,6 +78,11 @@ pub fn player_credentials_dir() -> PathBuf {
 
 pub fn log_file() -> PathBuf {
     app_dir().join("lite-spotify.log")
+}
+
+/// The queue and position at the last exit (see `session.rs`).
+pub fn session_file() -> PathBuf {
+    app_dir().join("session.json")
 }
 
 fn config_file() -> PathBuf {
@@ -96,10 +107,17 @@ impl Config {
     }
 
     fn try_save(&self) -> std::io::Result<()> {
-        fs::create_dir_all(app_dir())?;
-        // Write to a temporary file first so a crash never leaves a half-written config.
-        let tmp = config_file().with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        fs::rename(tmp, config_file())
+        write_atomic(
+            &config_file(),
+            serde_json::to_string_pretty(self)?.as_bytes(),
+        )
     }
+}
+
+/// Writes to a temporary file first, so a crash never leaves a half-written file.
+pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(app_dir())?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(tmp, path)
 }

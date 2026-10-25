@@ -6,8 +6,11 @@ mod app;
 mod auth;
 mod config;
 mod fun;
+mod media;
 mod player;
+mod session;
 mod theme;
+mod update;
 mod widgets;
 
 use eframe::egui;
