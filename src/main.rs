@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod auth;
 mod config;
+mod discord;
 mod fun;
 mod media;
 mod player;

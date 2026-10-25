@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, stream};
+use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
-use librespot_core::config::SessionConfig;
+use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::error::ErrorKind;
 use librespot_core::session::Session;
 use librespot_core::{Error as SpotError, SpotifyUri};
@@ -56,6 +57,27 @@ pub enum PlayerMsg {
     Unavailable {
         uri: String,
     },
+    /// What the Spotify Connect player is doing (controlled from another device).
+    Remote(RemoteMsg),
+}
+
+/// Events of the Spotify Connect player.
+#[derive(Debug)]
+pub enum RemoteMsg {
+    /// lite-spotify shows up as a Connect device now.
+    Ready,
+    Failed(String),
+    Playing {
+        uri: String,
+        position_ms: u32,
+    },
+    Paused {
+        uri: String,
+        position_ms: u32,
+    },
+    Stopped,
+    /// Volume changed from the other device (0.0 to 1.0).
+    Volume(f32),
 }
 
 /// The words of a song.
@@ -96,20 +118,74 @@ enum Cmd {
 pub struct PlayerCtl {
     cmds: mpsc::UnboundedSender<Cmd>,
     session: Arc<Mutex<Option<Session>>>,
+    /// The Spotify Connect device, while it runs.
+    spirc: Arc<Mutex<Option<Spirc>>>,
 }
 
 impl PlayerCtl {
     /// Starts logging in and setting up audio in the background.
+    /// With `connect`, lite-spotify also shows up as a Spotify Connect device,
+    /// so the Spotify app on a phone can play music here.
     pub fn start(
         rt: &tokio::runtime::Handle,
         http: reqwest::Client,
         volume: f32,
+        connect: bool,
         notify: impl Fn(PlayerMsg) + Send + Sync + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = Arc::new(Mutex::new(None));
-        rt.spawn(run(rx, session.clone(), http, volume, Arc::new(notify)));
-        Self { cmds: tx, session }
+        let spirc = Arc::new(Mutex::new(None));
+        let notify: Notify = Arc::new(notify);
+        let connect_slot = connect.then(|| spirc.clone());
+        rt.spawn(run(rx, session.clone(), http, volume, connect_slot, notify));
+        Self {
+            cmds: tx,
+            session,
+            spirc,
+        }
+    }
+
+    /// Runs `f` on the Spotify Connect device, if it is running.
+    fn remote(&self, f: impl FnOnce(&Spirc) -> Result<(), SpotError>) {
+        if let Some(spirc) = self.spirc.lock().unwrap().as_ref()
+            && let Err(e) = f(spirc)
+        {
+            log::warn!("Spotify Connect command failed: {e}");
+        }
+    }
+    pub fn remote_play_pause(&self) {
+        self.remote(Spirc::play_pause);
+    }
+    pub fn remote_pause(&self) {
+        self.remote(Spirc::pause);
+    }
+    pub fn remote_next(&self) {
+        self.remote(Spirc::next);
+    }
+    pub fn remote_previous(&self) {
+        self.remote(Spirc::prev);
+    }
+    pub fn remote_seek(&self, position_ms: u32) {
+        self.remote(|s| s.set_position_ms(position_ms));
+    }
+    pub fn remote_volume(&self, volume: f32) {
+        self.remote(|s| s.set_volume(to_mixer_volume(volume)));
+    }
+    /// Stops the Spotify Connect device (when the app closes or it is turned off).
+    pub fn stop_connect(&self) {
+        self.remote(Spirc::shutdown);
+    }
+
+    /// Looks up a song's details through the player's connection.
+    pub async fn track_info(&self, uri: &str) -> Result<Track> {
+        let session = self.session()?;
+        let uri = SpotifyUri::from_uri(uri)?;
+        tracks_from_uris(&session, vec![uri])
+            .await
+            .into_iter()
+            .next()
+            .context("Could not look up the song")
     }
 
     fn send(&self, cmd: Cmd) {
@@ -265,6 +341,78 @@ async fn tracks_from_uris(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track
         .await
 }
 
+/// Runs the Spotify Connect device until it stops. It has its own connection,
+/// player and volume, so it never gets in the way of the normal player: the
+/// app pauses one when the other starts.
+async fn run_connect(slot: Arc<Mutex<Option<Spirc>>>, volume: f32, notify: Notify) -> Result<()> {
+    let cache = Cache::new(Some(config::player_credentials_dir()), None, None, None)?;
+    let credentials = cache
+        .credentials()
+        .context("The player has no saved login yet")?;
+    let session = Session::new(SessionConfig::default(), Some(cache));
+    let mixer: Arc<dyn Mixer> = Arc::new(
+        SoftMixer::open(MixerConfig::default())
+            .map_err(|e| anyhow!("Could not set up volume control: {e}"))?,
+    );
+    let backend = audio_backend::find(None).context("No audio output available")?;
+    let player = Player::new(
+        player_config(),
+        session.clone(),
+        mixer.get_soft_volume(),
+        move || backend(None, AudioFormat::default()),
+    );
+    let mut events = player.get_player_event_channel();
+    let events_notify = notify.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let msg = match event {
+                PlayerEvent::Playing {
+                    track_id,
+                    position_ms,
+                    ..
+                } => RemoteMsg::Playing {
+                    uri: track_id.to_uri(),
+                    position_ms,
+                },
+                PlayerEvent::Paused {
+                    track_id,
+                    position_ms,
+                    ..
+                } => RemoteMsg::Paused {
+                    uri: track_id.to_uri(),
+                    position_ms,
+                },
+                PlayerEvent::Stopped { .. } => RemoteMsg::Stopped,
+                PlayerEvent::VolumeChanged { volume } => {
+                    RemoteMsg::Volume(volume as f32 / u16::MAX as f32)
+                }
+                _ => continue,
+            };
+            events_notify(PlayerMsg::Remote(msg));
+        }
+    });
+    let connect_config = ConnectConfig {
+        name: "lite-spotify".into(),
+        device_type: DeviceType::Computer,
+        initial_volume: to_mixer_volume(volume),
+        ..Default::default()
+    };
+    let (spirc, task) = Spirc::new(connect_config, session, credentials, player, mixer)
+        .await
+        .map_err(|e| anyhow!("Could not start Spotify Connect: {e}"))?;
+    *slot.lock().unwrap() = Some(spirc);
+    notify(PlayerMsg::Remote(RemoteMsg::Ready));
+    task.await;
+    Ok(())
+}
+
+fn player_config() -> PlayerConfig {
+    PlayerConfig {
+        bitrate: Bitrate::Bitrate320,
+        ..PlayerConfig::default()
+    }
+}
+
 /// Converts a 0.0–1.0 slider value into librespot's volume range.
 fn to_mixer_volume(volume: f32) -> u16 {
     (volume.clamp(0.0, 1.0) * u16::MAX as f32) as u16
@@ -277,6 +425,7 @@ async fn run(
     shared_session: Arc<Mutex<Option<Session>>>,
     http: reqwest::Client,
     volume: f32,
+    connect_slot: Option<Arc<Mutex<Option<Spirc>>>>,
     notify: Notify,
 ) {
     notify(PlayerMsg::Connecting);
@@ -305,13 +454,12 @@ async fn run(
         notify(PlayerMsg::Failed("No audio output available".into()));
         return;
     };
-    let player_config = PlayerConfig {
-        bitrate: Bitrate::Bitrate320,
-        ..PlayerConfig::default()
-    };
-    let player = Player::new(player_config, session, mixer.get_soft_volume(), move || {
-        backend(None, AudioFormat::default())
-    });
+    let player = Player::new(
+        player_config(),
+        session,
+        mixer.get_soft_volume(),
+        move || backend(None, AudioFormat::default()),
+    );
 
     let mut events = player.get_player_event_channel();
     let events_notify = notify.clone();
@@ -324,6 +472,19 @@ async fn run(
     });
 
     notify(PlayerMsg::Ready);
+
+    // Spotify Connect starts once the normal player has logged in (and saved
+    // the login it reuses).
+    if let Some(slot) = connect_slot {
+        let notify = notify.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_connect(slot.clone(), volume, notify.clone()).await {
+                log::warn!("Spotify Connect stopped: {e:#}");
+                notify(PlayerMsg::Remote(RemoteMsg::Failed(format!("{e:#}"))));
+            }
+            *slot.lock().unwrap() = None;
+        });
+    }
 
     while let Some(cmd) = cmds.recv().await {
         match cmd {

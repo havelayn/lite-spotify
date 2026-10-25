@@ -86,6 +86,7 @@ impl eframe::App for App {
         self.tick_quiz(ctx);
         self.update_media_popup();
         self.update_tray();
+        self.update_discord();
         self.handle_close(ctx);
         if self.now.playing {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -109,6 +110,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(p) = &self.player {
+            p.stop_connect();
+        }
         self.config.save();
         self.save_session();
         self.finish_listen();
@@ -912,6 +916,21 @@ impl App {
     }
 
     fn up_next(&mut self, ui: &mut Ui) {
+        if self.remote {
+            ui.label(
+                RichText::new("SPOTIFY CONNECT")
+                    .font(theme::bold(12.0))
+                    .color(muted()),
+            );
+            ui.label(
+                RichText::new(
+                    "Another device is playing music here. The buttons above control it; \
+                     change the queue on that device. Play any song here to take over.",
+                )
+                .color(subdued()),
+            );
+            return;
+        }
         let start = self.queue_pos + 1;
         let left = self.queue.len().saturating_sub(start);
         ui.horizontal(|ui| {
@@ -2221,6 +2240,8 @@ impl App {
         let mut reload = false;
         let mut retry = false;
         let mut relogin = false;
+        let mut restart_player = false;
+        let mut discord_changed = false;
         egui::CentralPanel::default()
             .frame(Frame::new().fill(bg()).inner_margin(Margin::symmetric(20, 14)))
             .show(ui, |ui| {
@@ -2382,6 +2403,27 @@ impl App {
                             .small()
                             .color(muted()),
                         );
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(
+                                &mut self.config.spotify_connect,
+                                "Spotify Connect: play music here from the Spotify app on your phone",
+                            )
+                            .changed()
+                        {
+                            self.config.save();
+                            restart_player = true;
+                        }
+                        let connect_note = match (&self.remote_status, self.config.spotify_connect) {
+                            (_, false) => "lite-spotify then shows up as a device called \"lite-spotify\" \
+                                in the Spotify app. It uses a second connection and player, so a bit \
+                                more memory; that's why it is off by default."
+                                .to_string(),
+                            (Some(Ok(())), true) => "On: pick \"lite-spotify\" under devices in the Spotify app.".to_string(),
+                            (Some(Err(e)), true) => format!("Spotify Connect could not start: {e}"),
+                            (None, true) => "Starting…".to_string(),
+                        };
+                        ui.label(RichText::new(connect_note).small().color(muted()));
                         if self.tray.is_some() {
                             ui.add_space(6.0);
                             if ui
@@ -2401,6 +2443,43 @@ impl App {
                                 .small()
                                 .color(muted()),
                             );
+                        }
+                    });
+
+                    settings_card(ui, "Discord status", |ui| {
+                        if ui
+                            .checkbox(&mut self.config.discord_enabled, "Show the song I'm listening to in Discord")
+                            .changed()
+                        {
+                            self.config.save();
+                            discord_changed = true;
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Discord needs an \"application\" for this, which you make yourself (free, two minutes): \
+                                 open discord.com/developers/applications, click New Application, name it \
+                                 lite-spotify (Discord shows this name) and copy its Application ID here.",
+                            )
+                            .small()
+                            .color(muted()),
+                        );
+                        ui.horizontal(|ui| {
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut self.config.discord_app_id)
+                                    .hint_text("Application ID (only numbers)")
+                                    .desired_width(240.0),
+                            );
+                            if edit.lost_focus() {
+                                self.config.save();
+                                discord_changed = true;
+                            }
+                            ui.hyperlink_to("Open the Discord developer page", "https://discord.com/developers/applications");
+                        });
+                        let id = self.config.discord_app_id.trim();
+                        if self.config.discord_enabled
+                            && (id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()))
+                        {
+                            ui.label(RichText::new("Paste the Application ID to turn it on.").color(theme::error()));
                         }
                     });
 
@@ -2503,6 +2582,12 @@ impl App {
         }
         if retry {
             self.start_player();
+        }
+        if discord_changed {
+            self.set_discord(self.config.discord_enabled);
+        }
+        if restart_player && self.player.is_some() {
+            self.restart_player();
         }
         if relogin {
             self.start_browser_sign_in();

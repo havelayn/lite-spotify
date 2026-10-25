@@ -26,6 +26,12 @@ What it can do:
 - **Tray icon (Windows):** lite-spotify has an icon next to the clock. Right-click it for
   play/pause, next, previous, mini player and Quit. In Settings you can make closing the
   window keep the music playing there.
+- **Spotify Connect (optional):** turn it on in Settings → Playback. lite-spotify then
+  appears as a device called "lite-spotify" in the Spotify app on your phone, so you can
+  pick music there and hear it here. The buttons in lite-spotify control it too. Off by
+  default because it uses a second connection (a bit more memory).
+- **Discord status (optional):** show "Listening to …" with the song in your Discord
+  status. See *Discord status* below.
 - **Stats tab:** how long you listened, your top songs and artists, and at what times you
   listen, for the last week, month, year or all time. Kept only on your computer.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
@@ -131,6 +137,20 @@ Next time you start the app you are signed in automatically.
 - **Port in use:** sign-in needs ports 8888 and 8898 on your own computer for a moment.
   If another program uses them, close it and try again.
 - Never share your `config.json` or the `player` folder: they contain your login.
+
+## Discord status
+
+Discord only shows a status for an "application" registered with Discord, which you make
+yourself. It's free and takes two minutes:
+
+1. Open <https://discord.com/developers/applications> and log in with your Discord account.
+2. Click **New Application**, name it `lite-spotify` (Discord shows this name in your
+   status), accept the terms and click **Create**.
+3. On the application's page, copy the **Application ID** (a long number).
+4. In lite-spotify, open **Settings → Discord status**, paste the ID and tick
+   **Show the song I'm listening to in Discord**.
+
+The Discord app has to run on the same computer. The status only shows while music plays.
 
 ## Building it yourself (optional)
 
