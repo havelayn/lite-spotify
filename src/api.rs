@@ -1,5 +1,5 @@
 //! Small client for the parts of the Spotify Web API the app needs:
-//! playlists, Liked Songs, albums and search.
+//! playlists, Liked Songs, albums, podcasts and search.
 
 use std::time::Duration;
 
@@ -17,17 +17,25 @@ const MAX_TRACKS: usize = 10_000;
 /// Development-mode apps may ask for at most 10 search results per type.
 const SEARCH_LIMIT: &str = "10";
 
-/// A track as the UI shows it.
+/// A song or podcast episode as the UI shows it.
 #[derive(Clone, Debug)]
 pub struct Track {
     pub uri: String,
     pub name: String,
+    /// Artists, or the show's name for an episode.
     pub artists: String,
+    /// Album name, or the release date for an episode.
     pub album: String,
     pub duration_ms: u32,
     /// Small album cover, used in the now-playing bar.
     pub image_url: Option<String>,
     pub playable: bool,
+    pub is_episode: bool,
+    /// Release year, 0 when unknown.
+    pub year: u16,
+    /// When the user saved it (Liked Songs) or added it to the playlist, as
+    /// "YYYY-MM-DD…". Empty when unknown.
+    pub added_at: String,
 }
 
 #[derive(Clone, Debug)]
@@ -45,19 +53,39 @@ pub struct Album {
     pub artists: String,
 }
 
+/// A podcast.
+#[derive(Clone, Debug)]
+pub struct Show {
+    pub id: String,
+    pub name: String,
+    pub publisher: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchResults {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,
     pub playlists: Vec<Playlist>,
+    pub shows: Vec<Show>,
 }
 
 /// Where a list of tracks comes from.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrackSource {
     LikedSongs,
-    Playlist { id: String, name: String },
-    Album { id: String, name: String },
+    Playlist {
+        id: String,
+        name: String,
+    },
+    Album {
+        id: String,
+        name: String,
+    },
+    /// The episodes of a podcast.
+    Show {
+        id: String,
+        name: String,
+    },
 }
 
 /// An HTTP error answer from the Web API.
@@ -186,32 +214,62 @@ impl WebApi {
         Ok(out)
     }
 
+    /// The podcasts the user follows.
+    pub async fn saved_shows(&self) -> Result<Vec<Show>> {
+        let mut out = Vec::new();
+        let mut next = Some(format!("{API}/me/shows?limit=50"));
+        while let Some(url) = next {
+            let page: Paging = self.get(&url, &[]).await?;
+            out.extend(parse_items::<RawSavedShow>(page.items).map(|s| s.show.into_show()));
+            next = page.next;
+        }
+        Ok(out)
+    }
+
     /// Loads every track of `source`, calling `on_page` after each page so the
     /// list can show up in the UI while the rest is still loading.
     pub async fn tracks(
         &self,
         source: &TrackSource,
+        on_page: impl FnMut(Vec<Track>),
+    ) -> Result<()> {
+        self.tracks_limited(source, MAX_TRACKS, on_page).await
+    }
+
+    /// Like [`Self::tracks`], but stops after about `max` tracks.
+    async fn tracks_limited(
+        &self,
+        source: &TrackSource,
+        max: usize,
         mut on_page: impl FnMut(Vec<Track>),
     ) -> Result<()> {
         // "market=from_token" makes Spotify say whether each track can be played in
         // the user's country. The `next` links Spotify returns keep the parameter.
-        let (mut next, album) = match source {
+        let (mut next, parent) = match source {
             TrackSource::LikedSongs => (
                 Some(format!("{API}/me/tracks?limit=50&market=from_token")),
                 None,
             ),
+            // additional_types=episode: without it, podcast episodes in playlists come back empty.
             TrackSource::Playlist { id, .. } => (
                 Some(format!(
-                    "{API}/playlists/{id}/items?limit=50&market=from_token"
+                    "{API}/playlists/{id}/items?limit=50&market=from_token&additional_types=track,episode"
                 )),
                 None,
             ),
-            TrackSource::Album { id, .. } => {
-                // Album tracks leave out the album itself, so fetch the album first.
-                let raw: RawAlbum = self
-                    .get(&format!("/albums/{id}"), &[("market", "from_token")])
-                    .await?;
-                let page = raw.tracks.clone().unwrap_or_default();
+            // Album tracks and show episodes leave out the album or show itself,
+            // so fetch that first; it comes with the first page.
+            TrackSource::Album { id, .. } | TrackSource::Show { id, .. } => {
+                let path = match source {
+                    TrackSource::Album { .. } => format!("/albums/{id}"),
+                    _ => format!("/shows/{id}"),
+                };
+                let raw: RawAlbum = self.get(&path, &[("market", "from_token")]).await?;
+                let page = raw
+                    .tracks
+                    .clone()
+                    .or(raw.episodes.clone())
+                    .unwrap_or_default();
                 let tracks: Vec<Track> = parse_items::<RawTrack>(page.items)
                     .filter_map(|t| t.into_track(Some(&raw)))
                     .collect();
@@ -223,22 +281,20 @@ impl WebApi {
         let mut count = 0;
         while let Some(url) = next {
             let page: Paging = self.get(&url, &[]).await?;
-            let tracks: Vec<Track> = if album.is_some() {
+            let tracks: Vec<Track> = if parent.is_some() {
                 parse_items::<RawTrack>(page.items)
-                    .filter_map(|t| t.into_track(album.as_ref()))
+                    .filter_map(|t| t.into_track(parent.as_ref()))
                     .collect()
             } else {
                 // Playlist and library entries wrap the track. Spotify renamed the
                 // field from "track" to "item" in 2026, so accept both.
                 parse_items::<RawEntry>(page.items)
-                    .filter_map(|e| e.item.or(e.track))
-                    .filter_map(|v| serde_json::from_value::<RawTrack>(v).ok())
-                    .filter_map(|t| t.into_track(None))
+                    .filter_map(RawEntry::into_track)
                     .collect()
             };
             count += tracks.len();
             on_page(tracks);
-            next = if count >= MAX_TRACKS { None } else { page.next };
+            next = if count >= max { None } else { page.next };
         }
         Ok(())
     }
@@ -249,7 +305,7 @@ impl WebApi {
                 "/search",
                 &[
                     ("q", query),
-                    ("type", "track,album,playlist"),
+                    ("type", "track,album,playlist,show"),
                     ("limit", SEARCH_LIMIT),
                     ("market", "from_token"),
                 ],
@@ -280,7 +336,24 @@ impl WebApi {
                         .collect()
                 })
                 .unwrap_or_default(),
+            shows: raw
+                .shows
+                .map(|p| {
+                    parse_items::<RawShow>(p.items)
+                        .map(RawShow::into_show)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
+    }
+
+    /// Loads up to `max` tracks of `source`, for the Fun tab's mixes.
+    pub async fn sample_tracks(&self, source: &TrackSource, max: usize) -> Result<Vec<Track>> {
+        let mut out = Vec::new();
+        self.tracks_limited(source, max, |page| out.extend(page))
+            .await?;
+        out.truncate(max);
+        Ok(out)
     }
 
     /// Downloads an image (album covers are small JPEGs).
@@ -291,7 +364,7 @@ impl WebApi {
 }
 
 /// Parses each entry on its own and skips the ones that do not fit (Spotify
-/// sometimes sends `null` entries, podcast episodes, and so on).
+/// sometimes sends `null` entries, local files, and so on).
 fn parse_items<T: DeserializeOwned>(items: Vec<Value>) -> impl Iterator<Item = T> {
     items
         .into_iter()
@@ -302,11 +375,17 @@ pub fn join_names(names: impl IntoIterator<Item = String>) -> String {
     names.into_iter().collect::<Vec<_>>().join(", ")
 }
 
-/// Picks the smallest cover that is still at least 64 pixels wide.
+/// The year at the start of a Spotify date ("2011", "2011-05" or "2011-05-20").
+fn year_of(date: &str) -> u16 {
+    date.get(..4).and_then(|y| y.parse().ok()).unwrap_or(0)
+}
+
+/// Picks the smallest cover that is at least 300 pixels wide (Spotify's middle
+/// size), which looks sharp in the now-playing panel.
 fn small_image(images: &[RawImage]) -> Option<String> {
     images
         .iter()
-        .filter(|i| i.width.unwrap_or(64) >= 64)
+        .filter(|i| i.width.unwrap_or(300) >= 300)
         .min_by_key(|i| i.width.unwrap_or(u32::MAX))
         .or(images.first())
         .map(|i| i.url.clone())
@@ -332,6 +411,18 @@ struct RawUser {
 struct RawEntry {
     item: Option<Value>,
     track: Option<Value>,
+    added_at: Option<String>,
+}
+
+impl RawEntry {
+    /// Playlist and library entries wrap the track. Spotify renamed the field
+    /// from "track" to "item" in 2026, so accept both.
+    fn into_track(self) -> Option<Track> {
+        let raw: RawTrack = serde_json::from_value(self.item.or(self.track)?).ok()?;
+        let mut track = raw.into_track(None)?;
+        track.added_at = self.added_at.unwrap_or_default();
+        Some(track)
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -346,6 +437,7 @@ struct RawArtist {
     name: String,
 }
 
+/// An album, or a podcast show (they are read the same way).
 #[derive(Deserialize, Clone)]
 struct RawAlbum {
     #[serde(default)]
@@ -356,7 +448,11 @@ struct RawAlbum {
     artists: Vec<RawArtist>,
     #[serde(default)]
     images: Vec<RawImage>,
+    #[serde(default)]
+    release_date: String,
     tracks: Option<Paging>,
+    /// Only on shows.
+    episodes: Option<Paging>,
 }
 
 impl RawAlbum {
@@ -385,25 +481,86 @@ struct RawTrack {
     is_playable: Option<bool>,
     #[serde(default)]
     is_local: bool,
+    // Only on podcast episodes:
+    show: Option<RawShow>,
+    #[serde(default)]
+    images: Vec<RawImage>,
+    #[serde(default)]
+    release_date: String,
 }
 
 impl RawTrack {
-    fn into_track(self, album_override: Option<&RawAlbum>) -> Option<Track> {
-        if self.kind != "track" {
-            return None; // e.g. a podcast episode in a playlist
+    /// `parent` is the album (for album tracks) or show (for episodes) the item came from.
+    fn into_track(self, parent: Option<&RawAlbum>) -> Option<Track> {
+        let playable_uri = match self.kind.as_str() {
+            "track" => "spotify:track:",
+            "episode" => "spotify:episode:",
+            _ => return None,
+        };
+        let playable =
+            !self.is_local && self.is_playable != Some(false) && self.uri.starts_with(playable_uri);
+        if self.kind == "episode" {
+            let show_name = parent
+                .map(|p| p.name.clone())
+                .or_else(|| self.show.as_ref().map(|s| s.name.clone()))
+                .unwrap_or_default();
+            let image_url = small_image(&self.images)
+                .or_else(|| parent.and_then(|p| small_image(&p.images)))
+                .or_else(|| self.show.as_ref().and_then(|s| small_image(&s.images)));
+            return Some(Track {
+                uri: self.uri,
+                name: self.name,
+                artists: show_name,
+                year: year_of(&self.release_date),
+                album: self.release_date,
+                duration_ms: self.duration_ms,
+                image_url,
+                playable,
+                is_episode: true,
+                added_at: String::new(),
+            });
         }
-        let album = album_override.or(self.album.as_ref());
+        let album = parent.or(self.album.as_ref());
         Some(Track {
-            playable: !self.is_local
-                && self.is_playable != Some(false)
-                && self.uri.starts_with("spotify:track:"),
+            playable,
             uri: self.uri,
             name: self.name,
             artists: join_names(self.artists.into_iter().map(|a| a.name)),
             album: album.map(|a| a.name.clone()).unwrap_or_default(),
             duration_ms: self.duration_ms,
             image_url: album.and_then(|a| small_image(&a.images)),
+            is_episode: false,
+            year: album.map(|a| year_of(&a.release_date)).unwrap_or(0),
+            added_at: String::new(),
         })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawSavedShow {
+    show: RawShow,
+}
+
+#[derive(Deserialize)]
+struct RawShow {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// Spotify stopped sending this to development-mode apps in 2026; may be missing.
+    #[serde(default)]
+    publisher: String,
+    #[serde(default)]
+    images: Vec<RawImage>,
+}
+
+impl RawShow {
+    fn into_show(self) -> Show {
+        Show {
+            id: self.id,
+            name: self.name,
+            publisher: self.publisher,
+        }
     }
 }
 
@@ -450,6 +607,7 @@ struct RawSearch {
     tracks: Option<Paging>,
     albums: Option<Paging>,
     playlists: Option<Paging>,
+    shows: Option<Paging>,
 }
 
 #[cfg(test)]
@@ -460,24 +618,47 @@ mod tests {
     fn playlist_entries_accept_old_and_new_field_names() {
         let page: Paging = serde_json::from_str(
             r#"{"items":[
-                {"item":{"type":"track","uri":"spotify:track:a","name":"New","artists":[{"name":"X"}],"duration_ms":1000,
-                         "album":{"name":"Al","images":[{"url":"big","width":640},{"url":"small","width":64}]}}},
+                {"added_at":"2020-01-01T00:00:00Z",
+                 "item":{"type":"track","uri":"spotify:track:a","name":"New","artists":[{"name":"X"}],"duration_ms":1000,
+                         "album":{"name":"Al","release_date":"1999-05-01","images":[{"url":"big","width":640},{"url":"mid","width":300},{"url":"small","width":64}]}}},
                 {"track":{"type":"track","uri":"spotify:track:b","name":"Old","artists":[],"duration_ms":2000}},
-                {"item":{"type":"episode","uri":"spotify:episode:c","name":"Pod"}},
+                {"item":{"type":"episode","uri":"spotify:episode:c","name":"Pod","release_date":"2026-01-02",
+                         "show":{"name":"My Show"}}},
+                {"item":{"type":"chapter","uri":"spotify:chapter:d","name":"Book"}},
                 null
             ],"next":null}"#,
         )
         .unwrap();
         let tracks: Vec<Track> = parse_items::<RawEntry>(page.items)
-            .filter_map(|e| e.item.or(e.track))
-            .filter_map(|v| serde_json::from_value::<RawTrack>(v).ok())
-            .filter_map(|t| t.into_track(None))
+            .filter_map(RawEntry::into_track)
             .collect();
-        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks.len(), 3);
         assert_eq!(tracks[0].name, "New");
-        assert_eq!(tracks[0].image_url.as_deref(), Some("small"));
+        assert_eq!(tracks[0].image_url.as_deref(), Some("mid"));
+        assert_eq!(tracks[0].year, 1999);
+        assert_eq!(tracks[0].added_at, "2020-01-01T00:00:00Z");
         assert_eq!(tracks[1].name, "Old");
         assert!(tracks[1].playable);
+        assert!(tracks[2].is_episode && tracks[2].playable);
+        assert_eq!(tracks[2].artists, "My Show");
+        assert_eq!(tracks[2].album, "2026-01-02");
+    }
+
+    #[test]
+    fn show_episodes_take_the_show_name() {
+        let show: RawAlbum = serde_json::from_str(
+            r#"{"id":"s","name":"The Show","images":[{"url":"cover","width":64}],
+                "episodes":{"items":[{"type":"episode","uri":"spotify:episode:e","name":"Ep 1",
+                "duration_ms":60000,"release_date":"2026-03-04"}],"next":null}}"#,
+        )
+        .unwrap();
+        let page = show.episodes.clone().unwrap();
+        let eps: Vec<Track> = parse_items::<RawTrack>(page.items)
+            .filter_map(|t| t.into_track(Some(&show)))
+            .collect();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].artists, "The Show");
+        assert_eq!(eps[0].image_url.as_deref(), Some("cover"));
     }
 
     #[test]

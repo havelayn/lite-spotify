@@ -4,8 +4,23 @@ A small, low-memory Spotify player for Windows. It uses your own **Spotify Premi
 Built in Rust with [egui](https://github.com/emilk/egui) for the window and
 [librespot](https://github.com/librespot-org/librespot) for audio.
 
-It can: sign in, show your playlists and Liked Songs, play songs, play/pause, next/previous,
-seek, volume, show what's playing (with a small cover), and search songs, albums and playlists.
+What it can do:
+
+- **Library:** Liked Songs and your playlists, in a simple song table.
+- **Search:** songs, albums, playlists and podcasts.
+- **Podcasts:** the shows you follow and their episodes.
+- **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
+  repeat, volume, and an **Up next** list. Right-click a song to add it to the queue.
+- **Fun tab** for when you don't know what to listen to:
+  - **Song Roulette:** spin the wheel.
+  - **Claw Machine:** grab a mystery song (it slips sometimes).
+  - **Slot Machine:** a line-up of three songs.
+  - **Mystery Cards:** turn over one of six cards.
+  - **This or That:** pick between two songs until one is left.
+  - **Time Machine:** songs from a year or decade.
+  - **Rediscover:** songs you saved long ago.
+  - **Surprise Mix:** random songs from all over your playlists.
+- **Settings:** accent colour, turn the Fun tab on or off, account and log file.
 
 Streaming only: nothing is downloaded or saved, and Premium is required for playback.
 
@@ -51,6 +66,7 @@ a green check mark and download **lite-spotify-windows** under **Artifacts**
    login for the audio player (Spotify only allows its own apps to stream audio).
    Click **Agree** again.
 4. Done. Double-click a song (or click its number) to play it. Press **Space** to pause.
+   Right-click a song to add it to the queue.
 
 Next time you start the app you are signed in automatically.
 
@@ -60,11 +76,14 @@ Next time you start the app you are signed in automatically.
   address bar). `config.json` holds your Client ID, login token and volume;
   the `player` folder holds the player's saved login. `lite-spotify.log` is the log file.
   Please attach it when you report a bug.
-- **Sign out:** click the ⚙ button at the top right and choose **Sign out**.
-- **Use a different Client ID:** sign out, then click **Use a different Client ID**.
+- **Sign out / use a different Client ID:** open the **Settings** tab.
+- **Turn off the Fun tab:** Settings → Fun tab. The games use almost no memory, and none
+  while turned off.
 - **Some playlists do not open:** Spotify limits what developer apps may read. If a playlist
   you follow but did not create can't be read through the Web API, lite-spotify tries to
   load it through the player connection instead.
+- **Some podcasts won't play:** video podcasts and podcasts Spotify doesn't host itself
+  may refuse to play here; lite-spotify then skips to the next one.
 - **Port in use:** sign-in needs ports 8888 and 8898 on your own computer for a moment.
   If another program uses them, close it and try again.
 - Never share your `config.json` or the `player` folder: they contain your login.

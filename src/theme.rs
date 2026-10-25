@@ -1,40 +1,65 @@
-//! Colours, fonts and the egui style: a dark look close to Spotify's.
+//! Colours, fonts and the egui style: a dark "midnight" look with a choice of
+//! accent colours.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Vec2,
 };
 
-/// Behind the panels.
-pub const BG: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
-/// The rounded panels (library and main area).
-pub const CARD: Color32 = Color32::from_rgb(0x12, 0x12, 0x12);
-/// Text boxes, menus and placeholders.
-pub const RAISED: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x1f);
-pub const HOVER: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
-pub const SELECTED: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
-pub const PLACEHOLDER: Color32 = Color32::from_rgb(0x28, 0x28, 0x28);
+/// Behind everything.
+pub const BG: Color32 = Color32::from_rgb(0x0e, 0x10, 0x16);
+/// Panels.
+pub const SURFACE: Color32 = Color32::from_rgb(0x16, 0x19, 0x22);
+/// Text boxes, every other table row, placeholders.
+pub const RAISED: Color32 = Color32::from_rgb(0x1c, 0x20, 0x2b);
+pub const HOVER: Color32 = Color32::from_rgb(0x25, 0x2a, 0x38);
+pub const SELECTED: Color32 = Color32::from_rgb(0x2c, 0x32, 0x44);
+pub const BORDER: Color32 = Color32::from_rgb(0x2a, 0x2f, 0x3e);
 
-pub const TEXT: Color32 = Color32::WHITE;
-pub const SUBDUED: Color32 = Color32::from_rgb(0xb3, 0xb3, 0xb3);
-pub const MUTED: Color32 = Color32::from_rgb(0x6a, 0x6a, 0x6a);
-pub const GREEN: Color32 = Color32::from_rgb(0x1e, 0xd7, 0x60);
-pub const ERROR: Color32 = Color32::from_rgb(0xf1, 0x5e, 0x6c);
+pub const TEXT: Color32 = Color32::from_rgb(0xe9, 0xeb, 0xf2);
+pub const SUBDUED: Color32 = Color32::from_rgb(0x9a, 0xa1, 0xb5);
+pub const MUTED: Color32 = Color32::from_rgb(0x5d, 0x64, 0x7a);
+/// Text drawn on top of the accent colour.
+pub const ON_ACCENT: Color32 = Color32::from_rgb(0x14, 0x16, 0x1d);
+pub const ERROR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x7a);
 
-/// Background colours for the top of the main area, picked per playlist.
-pub const HEADER_COLORS: [Color32; 8] = [
-    Color32::from_rgb(0x50, 0x38, 0xa0), // purple (Liked Songs)
-    Color32::from_rgb(0x1e, 0x5a, 0x7a),
-    Color32::from_rgb(0x7a, 0x3a, 0x2c),
-    Color32::from_rgb(0x2e, 0x6b, 0x45),
-    Color32::from_rgb(0x8a, 0x2c, 0x5a),
-    Color32::from_rgb(0x6b, 0x5a, 0x22),
-    Color32::from_rgb(0x2c, 0x45, 0x8a),
-    Color32::from_rgb(0x5a, 0x5a, 0x5a),
+/// The accent colours to choose from in Settings. The first is the default.
+pub const ACCENTS: [(&str, Color32); 5] = [
+    ("Amber", Color32::from_rgb(0xff, 0xb0, 0x2e)),
+    ("Coral", Color32::from_rgb(0xff, 0x77, 0x6b)),
+    ("Violet", Color32::from_rgb(0xa5, 0x8b, 0xff)),
+    ("Teal", Color32::from_rgb(0x2e, 0xd3, 0xb7)),
+    ("Sky", Color32::from_rgb(0x5c, 0xb4, 0xff)),
 ];
 
-/// Font family with the bold weight.
+static ACCENT: AtomicU32 = AtomicU32::new(0xffb02e);
+
+/// The current accent colour.
+pub fn accent() -> Color32 {
+    let rgb = ACCENT.load(Ordering::Relaxed);
+    Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+/// A see-through version of the accent, for highlighted backgrounds.
+pub fn accent_soft() -> Color32 {
+    let a = accent();
+    Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 40)
+}
+
+/// Switches the accent colour (by name from [`ACCENTS`]) and restyles the app.
+pub fn set_accent(ctx: &egui::Context, name: &str) {
+    let color = ACCENTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or(&ACCENTS[0])
+        .1;
+    let rgb = (color.r() as u32) << 16 | (color.g() as u32) << 8 | color.b() as u32;
+    ACCENT.store(rgb, Ordering::Relaxed);
+    apply_visuals(ctx);
+}
+
 fn bold_family() -> FontFamily {
     FontFamily::Name("bold".into())
 }
@@ -75,22 +100,42 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn setup(ctx: &egui::Context) {
+pub fn setup(ctx: &egui::Context, accent_name: &str) {
     setup_fonts(ctx);
     ctx.set_theme(egui::Theme::Dark);
+    set_accent(ctx, accent_name);
 
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.selectable_labels = false;
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.button_padding = Vec2::new(10.0, 5.0);
+        style.spacing.menu_margin = egui::Margin::same(6);
+        style.spacing.combo_width = 220.0;
+        for (text_style, font) in style.text_styles.iter_mut() {
+            *font = match text_style {
+                egui::TextStyle::Small => regular(12.0),
+                egui::TextStyle::Heading => bold(22.0),
+                egui::TextStyle::Monospace => FontId::monospace(13.0),
+                _ => regular(14.0),
+            };
+        }
+    });
+}
+
+fn apply_visuals(ctx: &egui::Context) {
+    let accent = accent();
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
-    v.window_fill = HOVER;
-    v.window_stroke = Stroke::NONE;
-    v.window_corner_radius = CornerRadius::same(6);
-    v.menu_corner_radius = CornerRadius::same(6);
+    v.window_fill = RAISED;
+    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_corner_radius = CornerRadius::same(8);
+    v.menu_corner_radius = CornerRadius::same(8);
     v.extreme_bg_color = RAISED;
     v.faint_bg_color = RAISED;
     v.code_bg_color = RAISED;
-    v.hyperlink_color = GREEN;
-    v.selection.bg_fill = Color32::from_rgb(0x1d, 0x6b, 0x38);
-    v.selection.stroke = Stroke::new(1.0, GREEN);
+    v.hyperlink_color = accent;
+    v.selection.bg_fill = accent_soft();
+    v.selection.stroke = Stroke::new(1.0, accent);
     v.text_edit_bg_color = Some(RAISED);
 
     let radius = CornerRadius::same(6);
@@ -103,32 +148,19 @@ pub fn setup(ctx: &egui::Context) {
     ] {
         w.corner_radius = radius;
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HOVER);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, SUBDUED);
-    v.widgets.inactive.bg_fill = HOVER;
-    v.widgets.inactive.weak_bg_fill = HOVER;
+    v.widgets.inactive.bg_fill = RAISED;
+    v.widgets.inactive.weak_bg_fill = RAISED;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.hovered.bg_fill = SELECTED;
-    v.widgets.hovered.weak_bg_fill = SELECTED;
+    v.widgets.hovered.bg_fill = HOVER;
+    v.widgets.hovered.weak_bg_fill = HOVER;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, MUTED);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.active.bg_fill = SELECTED;
     v.widgets.active.weak_bg_fill = SELECTED;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    v.widgets.open.weak_bg_fill = SELECTED;
     ctx.set_visuals_of(egui::Theme::Dark, v);
-
-    ctx.style_mut_of(egui::Theme::Dark, |style| {
-        style.interaction.selectable_labels = false;
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(12.0, 6.0);
-        style.spacing.menu_margin = egui::Margin::same(6);
-        for (text_style, font) in style.text_styles.iter_mut() {
-            *font = match text_style {
-                egui::TextStyle::Small => regular(12.0),
-                egui::TextStyle::Heading => bold(24.0),
-                egui::TextStyle::Monospace => FontId::monospace(13.0),
-                _ => regular(14.0),
-            };
-        }
-    });
 }
