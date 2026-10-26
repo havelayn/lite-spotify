@@ -42,6 +42,7 @@ pub enum FunAction {
 enum Game {
     Daily,
     Guess,
+    OlderNewer,
     Roulette,
     Claw,
     Slots,
@@ -53,9 +54,10 @@ enum Game {
 }
 
 impl Game {
-    const ALL: [Game; 10] = [
+    const ALL: [Game; 11] = [
         Game::Daily,
         Game::Guess,
+        Game::OlderNewer,
         Game::Roulette,
         Game::Claw,
         Game::Slots,
@@ -70,6 +72,7 @@ impl Game {
         match self {
             Game::Daily => "Daily Pick",
             Game::Guess => "Guess the Song",
+            Game::OlderNewer => "Older or Newer",
             Game::Roulette => "Song Roulette",
             Game::Claw => "Claw Machine",
             Game::Slots => "Slot Machine",
@@ -85,6 +88,7 @@ impl Game {
         match self {
             Game::Daily => "One song from your list, a new one every day.",
             Game::Guess => "Hear a few seconds of a song from your list. Which one is it?",
+            Game::OlderNewer => "Two songs from your list: which one came out first?",
             Game::Roulette => "Spin the wheel. Wherever the ball lands, that's your song.",
             Game::Claw => "Steer the claw, drop it and try to grab a prize. It slips sometimes!",
             Game::Slots => "Pull the lever for a line-up of three songs.",
@@ -128,6 +132,7 @@ pub struct Fun {
     duel: pickers::Duel,
     time_machine: pickers::TimeMachine,
     quiz: quiz::Quiz,
+    older: pickers::OlderNewer,
     daily: pickers::Daily,
 }
 
@@ -150,6 +155,7 @@ impl Fun {
             duel: pickers::Duel::default(),
             time_machine: pickers::TimeMachine,
             quiz: quiz::Quiz::default(),
+            older: pickers::OlderNewer::default(),
             daily: pickers::Daily::default(),
         }
     }
@@ -167,6 +173,7 @@ impl Fun {
             "mix" => Game::SurpriseMix,
             "guess" => Game::Guess,
             "daily" => Game::Daily,
+            "older" => Game::OlderNewer,
             _ => Game::Roulette,
         };
     }
@@ -205,9 +212,9 @@ impl Fun {
     }
 
     pub fn add_to_pool(&mut self, tracks: Vec<Track>) {
+        // Games keep going with the songs they have; only a new list restarts them.
         self.pool
             .extend(tracks.into_iter().filter(|t| t.playable && !t.is_episode));
-        self.pool_version += 1;
     }
 
     pub fn pool_done(&mut self, error: Option<String>) {
@@ -404,7 +411,8 @@ impl Fun {
             }
             return None;
         }
-        if self.pool.len() < 2 {
+        // Wait for a few songs, so a game doesn't start with only a handful.
+        if self.pool.len() < 2 || (self.pool_loading && self.pool.len() < 30) {
             if !self.pool_loading {
                 ui.add_space(20.0);
                 ui.label(
@@ -426,6 +434,7 @@ impl Fun {
             Game::Duel => self.duel.ui(ui, pool, version),
             Game::TimeMachine => self.time_machine.ui(ui, pool),
             Game::Rediscover => pickers::rediscover_ui(ui, pool),
+            Game::OlderNewer => self.older.ui(ui, pool, version),
             Game::SurpriseMix => None,
             Game::Guess => self.quiz.ui(ui, pool, version, actions),
             Game::Daily => self.daily.ui(ui, pool),
@@ -506,6 +515,7 @@ fn game_icon(game: Game) -> Icon {
     match game {
         Game::Daily => Icon::Heart,
         Game::Guess => Icon::Mic,
+        Game::OlderNewer => Icon::Repeat,
         Game::Roulette => Icon::Disc,
         Game::Claw => Icon::Plus,
         Game::Slots => Icon::Repeat,
@@ -528,9 +538,19 @@ pub fn source_name(source: &TrackSource) -> String {
     }
 }
 
-/// `n` different random songs from `pool`.
+/// `n` random songs from `pool`, all different when the pool is big enough.
+/// A smaller pool (e.g. while "Any song on Spotify" is still loading) has its
+/// songs repeated, so games always get exactly `n` and never run short.
 fn sample(pool: &[Track], n: usize) -> Vec<Track> {
-    pool.choose_multiple(&mut rand::rng(), n).cloned().collect()
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Track> = pool.choose_multiple(&mut rand::rng(), n).cloned().collect();
+    while out.len() < n {
+        let more = pool.choose_multiple(&mut rand::rng(), n - out.len());
+        out.extend(more.cloned());
+    }
+    out
 }
 
 /// Colours for capsules, cards and wheel labels.
@@ -575,4 +595,35 @@ fn song_card(ui: &Ui, rect: Rect, track: &Track, fill: Color32, stroke: Color32)
 /// Smooth slow-down curve for spins: fast at first, gently stopping at the end.
 fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(n: usize) -> Vec<Track> {
+        (0..n)
+            .map(|i| Track {
+                uri: format!("spotify:track:{i}"),
+                name: format!("Song {i}"),
+                playable: true,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sample_always_gives_enough_songs() {
+        // "Any song on Spotify" can start with fewer songs than a game needs.
+        for size in 1..20 {
+            assert_eq!(sample(&pool(size), 16).len(), 16, "pool of {size}");
+        }
+        assert!(sample(&[], 5).is_empty());
+        // Big enough pools give different songs.
+        let picked = sample(&pool(30), 12);
+        let mut uris: Vec<&str> = picked.iter().map(|t| t.uri.as_str()).collect();
+        uris.sort();
+        uris.dedup();
+        assert_eq!(uris.len(), 12);
+    }
 }

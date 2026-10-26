@@ -119,6 +119,18 @@ enum Cmd {
     Volume(f32),
 }
 
+/// How the player is set up. Changing these restarts the player.
+#[derive(Clone, Debug)]
+pub struct PlayerOptions {
+    pub volume: f32,
+    /// Also show up as a Spotify Connect device.
+    pub connect: bool,
+    /// Streaming quality in kbit/s: 96, 160 or 320.
+    pub quality: u16,
+    /// Play all songs at about the same loudness.
+    pub normalize: bool,
+}
+
 /// Handle the UI uses to control playback. Cheap to clone.
 #[derive(Clone)]
 pub struct PlayerCtl {
@@ -135,16 +147,22 @@ impl PlayerCtl {
     pub fn start(
         rt: &tokio::runtime::Handle,
         http: reqwest::Client,
-        volume: f32,
-        connect: bool,
+        options: PlayerOptions,
         notify: impl Fn(PlayerMsg) + Send + Sync + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = Arc::new(Mutex::new(None));
         let spirc = Arc::new(Mutex::new(None));
         let notify: Notify = Arc::new(notify);
-        let connect_slot = connect.then(|| spirc.clone());
-        rt.spawn(run(rx, session.clone(), http, volume, connect_slot, notify));
+        let connect_slot = options.connect.then(|| spirc.clone());
+        rt.spawn(run(
+            rx,
+            session.clone(),
+            http,
+            options,
+            connect_slot,
+            notify,
+        ));
         Self {
             cmds: tx,
             session,
@@ -427,7 +445,12 @@ async fn tracks_from_uris(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track
 /// Runs the Spotify Connect device until it stops. It has its own connection,
 /// player and volume, so it never gets in the way of the normal player: the
 /// app pauses one when the other starts.
-async fn run_connect(slot: Arc<Mutex<Option<Spirc>>>, volume: f32, notify: Notify) -> Result<()> {
+async fn run_connect(
+    slot: Arc<Mutex<Option<Spirc>>>,
+    options: PlayerOptions,
+    notify: Notify,
+) -> Result<()> {
+    let volume = options.volume;
     let cache = Cache::new(Some(config::player_credentials_dir()), None, None, None)?;
     let credentials = cache
         .credentials()
@@ -439,7 +462,7 @@ async fn run_connect(slot: Arc<Mutex<Option<Spirc>>>, volume: f32, notify: Notif
     );
     let backend = audio_backend::find(None).context("No audio output available")?;
     let player = Player::new(
-        player_config(),
+        player_config(&options),
         session.clone(),
         mixer.get_soft_volume(),
         move || backend(None, AudioFormat::default()),
@@ -489,9 +512,14 @@ async fn run_connect(slot: Arc<Mutex<Option<Spirc>>>, volume: f32, notify: Notif
     Ok(())
 }
 
-fn player_config() -> PlayerConfig {
+fn player_config(options: &PlayerOptions) -> PlayerConfig {
     PlayerConfig {
-        bitrate: Bitrate::Bitrate320,
+        bitrate: match options.quality {
+            96 => Bitrate::Bitrate96,
+            160 => Bitrate::Bitrate160,
+            _ => Bitrate::Bitrate320,
+        },
+        normalisation: options.normalize,
         ..PlayerConfig::default()
     }
 }
@@ -507,10 +535,11 @@ async fn run(
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     shared_session: Arc<Mutex<Option<Session>>>,
     http: reqwest::Client,
-    volume: f32,
+    options: PlayerOptions,
     connect_slot: Option<Arc<Mutex<Option<Spirc>>>>,
     notify: Notify,
 ) {
+    let volume = options.volume;
     notify(PlayerMsg::Connecting);
     let session = match connect(&http, &notify).await {
         Ok(s) => s,
@@ -538,7 +567,7 @@ async fn run(
         return;
     };
     let player = Player::new(
-        player_config(),
+        player_config(&options),
         session,
         mixer.get_soft_volume(),
         move || backend(None, AudioFormat::default()),
@@ -578,7 +607,7 @@ async fn run(
     if let Some(slot) = connect_slot {
         let notify = notify.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_connect(slot.clone(), volume, notify.clone()).await {
+            if let Err(e) = run_connect(slot.clone(), options.clone(), notify.clone()).await {
                 log::warn!("Spotify Connect stopped: {e:#}");
                 notify(PlayerMsg::Remote(RemoteMsg::Failed(format!("{e:#}"))));
             }

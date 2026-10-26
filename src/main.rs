@@ -4,6 +4,7 @@
 mod api;
 mod app;
 mod auth;
+mod autostart;
 mod config;
 mod discord;
 mod files;
@@ -31,11 +32,23 @@ fn main() -> eframe::Result {
         .build()
         .expect("could not start the async runtime");
 
+    // Open where the window was last time, at the size it had.
+    let saved = config::Config::load().window;
+    let (size, position) = match saved {
+        Some([x, y, w, h]) if (-50.0..8000.0).contains(&x) && (-50.0..8000.0).contains(&y) => {
+            ([w.max(860.0), h.max(540.0)], Some([x, y]))
+        }
+        _ => ([1200.0, 760.0], None),
+    };
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Some(position) = position {
+        viewport = viewport.with_position(position);
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("lite-spotify")
-            .with_inner_size([1200.0, 760.0])
+            .with_inner_size(size)
             .with_min_inner_size([860.0, 540.0])
             .with_icon(std::sync::Arc::new(egui::IconData {
                 rgba: tray::icon_rgba(64, tray::AMBER),

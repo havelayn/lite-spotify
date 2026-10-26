@@ -629,6 +629,14 @@ pub struct RowAction {
     pub queue: bool,
     /// Add to Liked Songs, or remove from it.
     pub like: bool,
+    /// Play right after the current song.
+    pub play_next: bool,
+    /// Play this song and similar ones after it.
+    pub radio: bool,
+    pub go_to_album: bool,
+    pub search_artist: bool,
+    /// Copy the song's Spotify link.
+    pub copy_link: bool,
     /// Add the song to this playlist.
     pub add_to: Option<String>,
     /// Make a new playlist with the song.
@@ -774,9 +782,16 @@ pub fn table_row(
         if ui.button("Play").clicked() {
             action.play = true;
         }
+        if ui.button("Play next").clicked() {
+            action.play_next = true;
+        }
         if ui.button("Add to queue").clicked() {
             action.queue = true;
         }
+        if !t.is_episode && ui.button("Start song radio").clicked() {
+            action.radio = true;
+        }
+        ui.separator();
         let like = if liked {
             "Remove from Liked Songs"
         } else {
@@ -790,6 +805,16 @@ pub fn table_row(
                 Some(id) => action.add_to = Some(id),
                 None => action.new_playlist = true,
             }
+        }
+        ui.separator();
+        if !t.album_id.is_empty() && ui.button("Go to album").clicked() {
+            action.go_to_album = true;
+        }
+        if !t.is_episode && ui.button("Search for the artist").clicked() {
+            action.search_artist = true;
+        }
+        if ui.button("Copy Spotify link").clicked() {
+            action.copy_link = true;
         }
         if menu.can_remove {
             ui.separator();

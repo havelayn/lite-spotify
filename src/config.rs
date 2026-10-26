@@ -44,6 +44,14 @@ pub struct Config {
     pub discord_app_id: String,
     /// Show small album covers in song lists (uses a little more memory and data).
     pub thumbnails: bool,
+    /// Streaming quality in kbit/s: 96, 160 or 320.
+    pub quality: u16,
+    /// Play all songs at about the same loudness.
+    pub normalize: bool,
+    /// Where the window was and how big: x, y, width, height (in points).
+    pub window: Option<[f32; 4]>,
+    /// Start lite-spotify when Windows starts.
+    pub autostart: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -77,6 +85,10 @@ impl Default for Config {
             discord_enabled: false,
             discord_app_id: String::new(),
             thumbnails: false,
+            quality: 320,
+            normalize: false,
+            window: None,
+            autostart: false,
         }
     }
 }

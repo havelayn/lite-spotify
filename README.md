@@ -39,12 +39,17 @@ What it can do:
   the app starts). **Import your whole Spotify history** to go back years: see
   *Importing your Spotify history* below. Kept only on your computer.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
-  repeat, volume, and an **Up next** list. Right-click a song to add it to the queue.
+  repeat, volume, and an **Up next** list. Right-click a song in Up next to remove it, or
+  click **Clear** to empty it.
+- **Right-click any song** for: Play, Play next, Add to queue, **Start song radio** (that
+  song and similar ones after it), Liked Songs, Add to playlist, **Go to album**,
+  **Search for the artist** and **Copy Spotify link** (to share it).
 - **Fun tab** for when you don't know what to listen to:
   - **Daily Pick:** one song from your list, a new one every day.
   - **Guess the Song:** it starts with just a tenth of a second of a song! Pick the right
     title out of four for 10 points, or hear 1, 3 or 5 seconds for 5, 3 or 1 point.
     Your own song comes back (paused) when you leave the game.
+  - **Older or Newer:** two songs from your list; click the one that came out first.
   - **Song Roulette:** spin the wheel.
   - **Claw Machine:** grab a mystery song (it slips sometimes).
   - **Slot Machine:** a line-up of three songs.
@@ -62,10 +67,15 @@ What it can do:
 - **Sleep timer:** under the volume. The music fades out and pauses after 15–90 minutes,
   or after the current song.
 - **Keyboard shortcuts:** Space play/pause, Ctrl+→/← next/previous, →/← skip 10 seconds,
-  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+1…6 tabs.
+  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+L lyrics, Ctrl+M mini player, Ctrl+1…6 tabs.
   The full list is in Settings.
 - **Update check:** when a new version is out, a banner with a **Download** button
   appears at the top.
+- **Playback settings:** sound quality (Very high 320 kbit/s, Normal, or Data saver),
+  **same loudness for all songs**, and **start lite-spotify when Windows starts**.
+- The window opens where you left it, at the same size.
+- If something goes wrong in one screen, lite-spotify resets that screen instead of closing
+  (and writes the details to the log file).
 - **Settings:** dark or light look (the window's title bar follows), accent colour (or
   **Album**: the colour of the cover that is playing; the app icon in the taskbar and Task
   Manager follows), **album covers in song lists** (off by default), turn the Fun tab on
