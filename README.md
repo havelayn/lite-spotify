@@ -11,8 +11,9 @@ What it can do:
   Time) to sort by it. Play then follows the order you see.
 - **Heart button:** save the song that is playing to Liked Songs (or click the heart in
   any song row).
-- **Search:** songs, albums, playlists and podcasts, with recent searches and quick ideas
-  (Chill, Workout, Focus, …) for when you don't know what to look for.
+- **Search:** songs, albums, playlists and podcasts. Before you search, the Search tab
+  shows your recent searches and **your top songs, artists and albums** on Spotify
+  (last 4 weeks, 6 months or year).
 - **Your own playlists:** make new ones, add songs (right-click a song → Add to playlist,
   or "+ Add to playlist" under the song that is playing), remove songs and rename them.
 - **Similar songs:** after a single song, or when a list ends, lite-spotify keeps playing
@@ -32,15 +33,18 @@ What it can do:
   default because it uses a second connection (a bit more memory).
 - **Discord status (optional):** show "Listening to …" with the song in your Discord
   status. See *Discord status* below.
-- **Stats tab:** how long you listened, your top songs and artists, and at what times you
-  listen, for the last week, month, year or all time. Kept only on your computer.
+- **Stats tab:** minutes listened, top songs, artists and albums, streaks, your biggest
+  day, listening over time and at what times you listen, for the last week, month, year
+  or all time. Songs you play on your phone count too (Spotify reports the last 50 when
+  the app starts). **Import your whole Spotify history** to go back years: see
+  *Importing your Spotify history* below. Kept only on your computer.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
   repeat, volume, and an **Up next** list. Right-click a song to add it to the queue.
 - **Fun tab** for when you don't know what to listen to:
   - **Daily Pick:** one song from your list, a new one every day.
-  - **Guess the Song:** hear 5 seconds of a song from your list and pick the right title
-    out of four. Need more? +5 seconds, for fewer points. Your own song comes back
-    (paused) when you leave the game.
+  - **Guess the Song:** it starts with just a tenth of a second of a song! Pick the right
+    title out of four for 10 points, or hear 1, 3 or 5 seconds for 5, 3 or 1 point.
+    Your own song comes back (paused) when you leave the game.
   - **Song Roulette:** spin the wheel.
   - **Claw Machine:** grab a mystery song (it slips sometimes).
   - **Slot Machine:** a line-up of three songs.
@@ -49,6 +53,8 @@ What it can do:
   - **Time Machine:** songs from a year or decade.
   - **Rediscover:** songs you saved long ago.
   - **Surprise Mix:** random songs from all over your playlists.
+  - The games can pick from Liked Songs, any playlist, **Popular right now** (the songs on
+    Spotify's Top 50 charts of many countries) or **Any song on Spotify**.
 - **Media keys:** the play/pause, next and previous keys on your keyboard work, and
   Windows shows the song (with its cover) in the media popup next to the volume.
 - **Continues where you left off:** when you start the app, the last song and the queue
@@ -56,12 +62,14 @@ What it can do:
 - **Sleep timer:** under the volume. The music fades out and pauses after 15–90 minutes,
   or after the current song.
 - **Keyboard shortcuts:** Space play/pause, Ctrl+→/← next/previous, →/← skip 10 seconds,
-  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+1…5 tabs.
+  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+1…6 tabs.
   The full list is in Settings.
 - **Update check:** when a new version is out, a banner with a **Download** button
   appears at the top.
-- **Settings:** dark or light look, accent colour (or **Album**: the colour of the cover
-  that is playing), turn the Fun tab on or off, account and log file.
+- **Settings:** dark or light look (the window's title bar follows), accent colour (or
+  **Album**: the colour of the cover that is playing; the app icon in the taskbar and Task
+  Manager follows), **album covers in song lists** (off by default), turn the Fun tab on
+  or off, account and log file.
 
 Streaming only: nothing is downloaded or saved, and Premium is required for playback.
 
@@ -137,6 +145,22 @@ Next time you start the app you are signed in automatically.
 - **Port in use:** sign-in needs ports 8888 and 8898 on your own computer for a moment.
   If another program uses them, close it and try again.
 - Never share your `config.json` or the `player` folder: they contain your login.
+
+## Importing your Spotify history
+
+Spotify doesn't let apps read how long you have listened in total, but you can ask Spotify
+for your own data and import it:
+
+1. Open <https://www.spotify.com/account/privacy/> and log in.
+2. Tick **Extended streaming history** (every year you've used Spotify; Spotify says it can
+   take up to 30 days) or **Account data** (the last year; usually a few days), and click
+   **Request data**. Confirm the email Spotify sends.
+3. When the next email arrives, download the zip file, right-click it and choose
+   **Extract All**.
+4. In lite-spotify, open the **Stats** tab, click **Import Spotify data…** and choose the
+   extracted folder (or drag the folder onto the window).
+
+Importing the same files again doesn't count them twice.
 
 ## Discord status
 

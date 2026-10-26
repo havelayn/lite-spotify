@@ -6,12 +6,14 @@ mod app;
 mod auth;
 mod config;
 mod discord;
+mod files;
 mod fun;
 mod media;
 mod player;
 mod session;
 mod stats;
 mod theme;
+mod thumbs;
 mod tray;
 mod update;
 mod widgets;
@@ -36,7 +38,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([860.0, 540.0])
             .with_icon(std::sync::Arc::new(egui::IconData {
-                rgba: tray::icon_rgba(64),
+                rgba: tray::icon_rgba(64, tray::AMBER),
                 width: 64,
                 height: 64,
             })),

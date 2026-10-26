@@ -42,6 +42,8 @@ pub struct Config {
     pub discord_enabled: bool,
     /// The Application ID of the user's own Discord application.
     pub discord_app_id: String,
+    /// Show small album covers in song lists (uses a little more memory and data).
+    pub thumbnails: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -74,6 +76,7 @@ impl Default for Config {
             spotify_connect: false,
             discord_enabled: false,
             discord_app_id: String::new(),
+            thumbnails: false,
         }
     }
 }

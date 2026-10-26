@@ -28,6 +28,8 @@ pub const WEB_SCOPES: &[&str] = &[
     "playlist-read-collaborative",
     "user-library-read",
     "user-library-modify",
+    "user-top-read",
+    "user-read-recently-played",
     "playlist-modify-private",
     "playlist-modify-public",
 ];
@@ -42,6 +44,10 @@ pub const EDIT_SCOPES: &[&str] = &[
 
 /// Spotify only lets its own client ID log in to the audio servers, so the
 /// player logs in with the ID librespot uses, on the redirect URI registered for it.
+/// Needed for the top songs on the Search tab and for adding plays from other
+/// devices to the stats. Logins from before 0.8.0 lack them.
+pub const HISTORY_SCOPES: &[&str] = &["user-top-read", "user-read-recently-played"];
+
 pub const PLAYER_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
 pub const PLAYER_SCOPES: &[&str] = &["streaming"];
 

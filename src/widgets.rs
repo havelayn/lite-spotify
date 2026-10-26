@@ -420,6 +420,18 @@ pub fn paint_cover(ui: &Ui, rect: Rect, texture: Option<&TextureHandle>, icon: I
 
 /// One line in a list on the left (Liked Songs, a playlist, a podcast).
 pub fn nav_row(ui: &mut Ui, icon: Icon, text: &str, selected: bool, playing: bool) -> Response {
+    nav_row_with(ui, icon, None, text, selected, playing)
+}
+
+/// Like [`nav_row`], with a cover thumbnail instead of the icon when there is one.
+pub fn nav_row_with(
+    ui: &mut Ui,
+    icon: Icon,
+    thumb: Option<&TextureHandle>,
+    text: &str,
+    selected: bool,
+    playing: bool,
+) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
     if selected {
         ui.painter()
@@ -440,9 +452,24 @@ pub fn nav_row(ui: &mut Ui, icon: Icon, text: &str, selected: bool, playing: boo
     } else {
         subdued()
     };
-    let icon_rect =
-        Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), Vec2::splat(15.0));
-    paint_icon(ui.painter(), icon_rect, icon, color);
+    match thumb {
+        Some(thumb) => {
+            let image = Rect::from_center_size(
+                pos2(rect.left() + 20.0, rect.center().y),
+                Vec2::splat(24.0),
+            );
+            egui::Image::new((thumb.id(), image.size()))
+                .corner_radius(CornerRadius::same(3))
+                .paint_at(ui, image);
+        }
+        None => {
+            let icon_rect = Rect::from_center_size(
+                pos2(rect.left() + 20.0, rect.center().y),
+                Vec2::splat(15.0),
+            );
+            paint_icon(ui.painter(), icon_rect, icon, color);
+        }
+    }
     let text_rect = Rect::from_min_max(
         pos2(rect.left() + 36.0, rect.top()),
         pos2(rect.right() - 6.0, rect.bottom()),
@@ -614,6 +641,8 @@ pub struct RowState {
     pub is_current: bool,
     pub is_playing: bool,
     pub liked: bool,
+    /// The album cover, when thumbnails are turned on and it has loaded.
+    pub thumb: Option<TextureHandle>,
 }
 
 /// One song row: double-click (or click the number) to play, right-click for a
@@ -630,6 +659,7 @@ pub fn table_row(
         is_current,
         is_playing,
         liked,
+        thumb,
     } = state;
     let response = ui.interact(rect, ui.scope_id().with(("row", number)), Sense::click());
     let hovered = response.hovered();
@@ -681,7 +711,20 @@ pub fn table_row(
         (3, &t.album, other_color),
     ];
     for (i, text, color) in texts {
-        place_in(ui, cell(i).shrink2(vec2(8.0, 0.0)), |ui| {
+        let mut cell = cell(i);
+        if i == 1
+            && let Some(thumb) = &thumb
+        {
+            let image = Rect::from_min_size(
+                pos2(cell.left() + 6.0, cell.center().y - 11.0),
+                Vec2::splat(22.0),
+            );
+            egui::Image::new((thumb.id(), image.size()))
+                .corner_radius(CornerRadius::same(3))
+                .paint_at(ui, image);
+            cell.set_left(image.right() + 2.0);
+        }
+        place_in(ui, cell.shrink2(vec2(8.0, 0.0)), |ui| {
             ui.add(egui::Label::new(RichText::new(text.as_str()).color(color)).truncate());
         });
     }

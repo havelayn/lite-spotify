@@ -113,6 +113,12 @@ pub const ALBUM_ACCENT: &str = "Album";
 
 static ACCENT: AtomicU32 = AtomicU32::new(0xffb02e);
 
+/// The accent colour as chosen (not darkened for the light look).
+pub fn accent_rgb() -> [u8; 3] {
+    let rgb = ACCENT.load(Ordering::Relaxed);
+    [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]
+}
+
 /// The current accent colour (a little darker in the light look, so text in it
 /// stays readable).
 pub fn accent() -> Color32 {
