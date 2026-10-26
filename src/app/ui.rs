@@ -10,12 +10,22 @@ use rand::Rng;
 use std::time::{Duration, Instant};
 
 use super::{App, Dialog, ListView, NOTICE_TIME, PlayerState, Screen, Sleep, Tab};
-use crate::api::{Track, TrackSource};
+use crate::api::{self, Track, TrackSource};
 use crate::auth;
 use crate::config::{self, Repeat};
 use crate::stats;
 use crate::theme::{self, bg, border, hover, muted, raised, subdued, surface};
 use crate::widgets::{self, ButtonStyle, Icon, RowAction, RowMenu, RowState, format_time};
+
+/// What the user did on the Search tab before searching.
+enum HomeAction {
+    Range(api::TopRange),
+    ShowAll(bool),
+    Song(ListAction),
+    Search(String),
+    Open(TrackSource),
+    SignIn,
+}
 
 /// What the user did in a song list.
 enum ListAction {
@@ -29,24 +39,6 @@ enum ListAction {
     Remove(usize),
     Rename,
 }
-
-/// Quick searches on the Search tab, for when you don't know what to look for.
-const SEARCH_IDEAS: [&str; 14] = [
-    "Chill",
-    "Workout",
-    "Focus",
-    "Party",
-    "Sleep",
-    "Lo-fi",
-    "Rock",
-    "Hip hop",
-    "Jazz",
-    "Acoustic",
-    "80s",
-    "90s",
-    "Summer",
-    "Road trip",
-];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Which {
@@ -86,6 +78,8 @@ impl eframe::App for App {
         self.tick_quiz(ctx);
         self.update_media_popup();
         self.update_tray();
+        self.update_window_look(ctx);
+        self.load_thumbs();
         self.update_discord();
         self.handle_close(ctx);
         if self.now.playing {
@@ -961,7 +955,17 @@ impl App {
                             .rect_filled(rect, CornerRadius::same(6), hover());
                     }
                     let queued = offset < self.user_queued;
-                    let text = rect.shrink2(vec2(8.0, 3.0));
+                    let mut text = rect.shrink2(vec2(8.0, 3.0));
+                    if let Some(thumb) = self.thumbs.get(t.thumb_url.as_deref()) {
+                        let image = Rect::from_min_size(
+                            pos2(rect.left() + 6.0, rect.top() + 4.0),
+                            Vec2::splat(32.0),
+                        );
+                        egui::Image::new((thumb.id(), image.size()))
+                            .corner_radius(CornerRadius::same(4))
+                            .paint_at(ui, image);
+                        text.set_left(image.right() + 8.0);
+                    }
                     widgets::place(
                         ui,
                         egui::UiBuilder::new()
@@ -1483,8 +1487,16 @@ impl App {
                     Some(TrackSource::Playlist { id, .. }) if *id == p.id);
                 let playing = matches!(&self.playing_source,
                     Some(TrackSource::Playlist { id, .. }) if *id == p.id);
-                let response = widgets::nav_row(ui, Icon::Note, &p.name, selected, playing)
-                    .on_hover_text(format!("{} · by {} · {} songs", p.name, p.owner, p.total));
+                let thumb = self.thumbs.get(p.image_url.as_deref());
+                let response = widgets::nav_row_with(
+                    ui,
+                    Icon::Note,
+                    thumb.as_ref(),
+                    &p.name,
+                    selected,
+                    playing,
+                )
+                .on_hover_text(format!("{} · by {} · {} songs", p.name, p.owner, p.total));
                 if response.clicked() {
                     open = Some(TrackSource::Playlist {
                         id: p.id.clone(),
@@ -1557,7 +1569,15 @@ impl App {
                     Some(TrackSource::Show { id, .. }) if *id == s.id);
                 let playing = matches!(&self.playing_source,
                     Some(TrackSource::Show { id, .. }) if *id == s.id);
-                let mut response = widgets::nav_row(ui, Icon::Mic, &s.name, selected, playing);
+                let thumb = self.thumbs.get(s.image_url.as_deref());
+                let mut response = widgets::nav_row_with(
+                    ui,
+                    Icon::Mic,
+                    thumb.as_ref(),
+                    &s.name,
+                    selected,
+                    playing,
+                );
                 if !s.publisher.is_empty() {
                     response = response.on_hover_text(format!("{} · {}", s.name, s.publisher));
                 }
@@ -1659,6 +1679,8 @@ impl App {
             TrackSource::Playlist { name, .. } => ("Playlist", name.clone()),
             TrackSource::Album { name, .. } => ("Album", name.clone()),
             TrackSource::Show { name, .. } => ("Podcast", name.clone()),
+            TrackSource::Popular => ("Spotify charts", "Popular right now".to_string()),
+            TrackSource::AnySong => ("All of Spotify", "Random songs".to_string()),
         };
         let owner = match source {
             TrackSource::Playlist { id, .. } => self
@@ -1782,6 +1804,7 @@ impl App {
                         is_current,
                         is_playing: is_current && self.now.playing,
                         liked: self.is_liked(&t.uri),
+                        thumb: self.thumbs.get(t.thumb_url.as_deref()),
                     };
                     let row = widgets::table_row(ui, rect, i + 1, t, state, &menu);
                     if let Some(a) = Self::row_to_action(row, row_index) {
@@ -1854,6 +1877,14 @@ impl App {
 
     /// The Search tab: a big search box, then recent searches and ideas, or the results.
     fn search_tab(&mut self, ui: &mut Ui) {
+        if self.search.query.is_empty()
+            && self.top.is_none()
+            && self.api.is_some()
+            && self.can_read_history
+        {
+            self.load_top(api::TopRange::HalfYear);
+        }
+        let mut home = None;
         let mut action = None;
         let mut open = None;
         let mut search_for: Option<String> = None;
@@ -1890,14 +1921,7 @@ impl App {
                                 });
                                 ui.add_space(8.0);
                             }
-                            section_title(ui, "Not sure? Try one of these");
-                            ui.horizontal_wrapped(|ui| {
-                                for idea in SEARCH_IDEAS {
-                                    if mood_chip(ui, idea).clicked() {
-                                        search_for = Some(idea.to_string());
-                                    }
-                                }
-                            });
+                            home = self.search_home(ui);
                             return;
                         }
 
@@ -1944,6 +1968,7 @@ impl App {
                                         is_current,
                                         is_playing: is_current && self.now.playing,
                                         liked: self.is_liked(&t.uri),
+                                        thumb: self.thumbs.get(t.thumb_url.as_deref()),
                                     };
                                     let row = widgets::table_row(ui, rect, i + 1, t, state, &menu);
                                     if let Some(a) = Self::row_to_action(row, i) {
@@ -1958,8 +1983,14 @@ impl App {
                             section_title(&mut cols[0], "Albums");
                             empty_hint(&mut cols[0], results.albums.is_empty(), "No albums found");
                             for a in &results.albums {
-                                if result_row(&mut cols[0], Icon::Disc, &a.name, &a.artists)
-                                    .clicked()
+                                if result_row(
+                                    &mut cols[0],
+                                    Icon::Disc,
+                                    self.thumbs.get(a.image_url.as_deref()),
+                                    &a.name,
+                                    &a.artists,
+                                )
+                                .clicked()
                                 {
                                     open = Some(TrackSource::Album {
                                         id: a.id.clone(),
@@ -1977,6 +2008,7 @@ impl App {
                                 if result_row(
                                     &mut cols[1],
                                     Icon::Note,
+                                    self.thumbs.get(p.image_url.as_deref()),
                                     &p.name,
                                     &format!("by {}", p.owner),
                                 )
@@ -1996,7 +2028,14 @@ impl App {
                                 } else {
                                     &s.publisher
                                 };
-                                if result_row(&mut cols[2], Icon::Mic, &s.name, subtitle).clicked()
+                                if result_row(
+                                    &mut cols[2],
+                                    Icon::Mic,
+                                    self.thumbs.get(s.image_url.as_deref()),
+                                    &s.name,
+                                    subtitle,
+                                )
+                                .clicked()
                                 {
                                     open = Some(TrackSource::Show {
                                         id: s.id.clone(),
@@ -2011,6 +2050,29 @@ impl App {
             self.search_input = query;
             self.start_search();
         }
+        match home {
+            Some(HomeAction::Range(range)) => self.load_top(range),
+            Some(HomeAction::ShowAll(on)) => {
+                if let Some(top) = &mut self.top {
+                    top.show_all = on;
+                }
+            }
+            Some(HomeAction::Song(row)) => {
+                let tracks = self
+                    .top
+                    .as_ref()
+                    .map(|t| t.tracks.clone())
+                    .unwrap_or_default();
+                self.apply_action(tracks, None, row);
+            }
+            Some(HomeAction::Search(query)) => {
+                self.search_input = query;
+                self.start_search();
+            }
+            Some(HomeAction::Open(source)) => self.open_list(source),
+            Some(HomeAction::SignIn) => self.start_browser_sign_in(),
+            None => {}
+        }
         if let Some(action) = action {
             let tracks = self
                 .search
@@ -2023,6 +2085,154 @@ impl App {
         if let Some(source) = open {
             self.open_list(source);
         }
+    }
+
+    /// The Search tab before searching: the user's top songs, artists and
+    /// albums from Spotify.
+    fn search_home(&self, ui: &mut Ui) -> Option<HomeAction> {
+        let mut action = None;
+        if !self.can_read_history {
+            section_title(ui, "Your top songs, artists and albums");
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(
+                        "lite-spotify needs one more permission from Spotify to show what you \
+                         listen to most.",
+                    )
+                    .color(subdued()),
+                );
+                if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 13.0).clicked() {
+                    action = Some(HomeAction::SignIn);
+                }
+            });
+            return action;
+        }
+        let Some(top) = &self.top else { return None };
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Your top songs")
+                    .font(theme::bold(18.0))
+                    .color(theme::text()),
+            );
+            ui.add_space(8.0);
+            for range in api::TopRange::ALL {
+                let style = if range == top.range {
+                    ButtonStyle::Accent
+                } else {
+                    ButtonStyle::Ghost
+                };
+                if widgets::button(ui, range.name(), style, 12.0).clicked() {
+                    action = Some(HomeAction::Range(range));
+                }
+            }
+            if top.loading {
+                ui.add(egui::Spinner::new().size(16.0).color(theme::accent()));
+            }
+        });
+        ui.add_space(4.0);
+        if let Some(e) = &top.error {
+            ui.label(
+                RichText::new(format!("Spotify did not send your top songs: {e}"))
+                    .color(theme::error()),
+            );
+            return action;
+        }
+        if !top.loading && top.tracks.is_empty() {
+            ui.label(
+                RichText::new("Spotify has no top songs for you yet. Listen a bit more!")
+                    .color(subdued()),
+            );
+            return action;
+        }
+
+        // Songs.
+        let menu = self.row_menu(None);
+        let shown = if top.show_all {
+            top.tracks.len()
+        } else {
+            top.tracks.len().min(10)
+        };
+        let (header, _) = ui.allocate_exact_size(
+            vec2(ui.available_width(), widgets::HEADER_HEIGHT),
+            Sense::hover(),
+        );
+        widgets::table_header(ui, header, ["ARTIST", "ALBUM"]);
+        ui.add_space(4.0);
+        let current = self.now.track.as_ref().map(|t| t.uri.as_str());
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, t) in top.tracks.iter().take(shown).enumerate() {
+                let (rect, _) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), widgets::ROW_HEIGHT),
+                    Sense::hover(),
+                );
+                let is_current = current == Some(t.uri.as_str());
+                let state = RowState {
+                    is_current,
+                    is_playing: is_current && self.now.playing,
+                    liked: self.is_liked(&t.uri),
+                    thumb: self.thumbs.get(t.thumb_url.as_deref()),
+                };
+                let row = widgets::table_row(ui, rect, i + 1, t, state, &menu);
+                if let Some(a) = Self::row_to_action(row, i) {
+                    action = Some(HomeAction::Song(a));
+                }
+            }
+        });
+        if top.tracks.len() > 10 {
+            ui.add_space(4.0);
+            let label = if top.show_all {
+                "Show fewer".to_string()
+            } else {
+                format!("Show all {}", top.tracks.len())
+            };
+            if widgets::button(ui, &label, ButtonStyle::Ghost, 12.0).clicked() {
+                action = Some(HomeAction::ShowAll(!top.show_all));
+            }
+        }
+
+        // Artists.
+        if !top.artists.is_empty() {
+            section_title(ui, "Your top artists");
+            ui.horizontal_wrapped(|ui| {
+                for artist in &top.artists {
+                    let thumb = self.thumbs.get(artist.image_url.as_deref());
+                    if tile(ui, thumb.as_ref(), Icon::Mic, &artist.name, "Artist", true)
+                        .on_hover_text(format!("Search for {}", artist.name))
+                        .clicked()
+                    {
+                        action = Some(HomeAction::Search(artist.name.clone()));
+                    }
+                }
+            });
+        }
+
+        // Albums.
+        if !top.albums.is_empty() {
+            section_title(ui, "Your top albums");
+            ui.horizontal_wrapped(|ui| {
+                for album in &top.albums {
+                    let thumb = self.thumbs.get(album.image_url.as_deref());
+                    if tile(
+                        ui,
+                        thumb.as_ref(),
+                        Icon::Disc,
+                        &album.name,
+                        &album.artists,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        action = Some(HomeAction::Open(TrackSource::Album {
+                            id: album.id.clone(),
+                            name: album.name.clone(),
+                        }));
+                    }
+                }
+            });
+        }
+        action
     }
 
     /// The large search box on the Search tab. Returns true when the user presses Enter.
@@ -2108,126 +2318,112 @@ impl App {
         }
     }
 
-    /// Your stats: listening time, top songs and artists, and when you listen.
+    /// Your stats: listening time, top songs, artists and albums, when you
+    /// listen, and importing Spotify's own history.
     fn stats_tab(&mut self, ui: &mut Ui) {
+        // Files dragged onto the window are imported.
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.start_import(dropped);
+        }
+        let hovering_files = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         if self.stats.is_none() {
             self.show_stats(stats::Period::Month);
         }
         let Some(view) = &self.stats else { return };
         let mut period = view.period;
         let mut clear = false;
+        let mut pick = false;
+        let importing = self.importing;
         let sum = &view.summary;
         egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(bg())
-                    .inner_margin(Margin::symmetric(20, 14)),
-            )
+            .frame(Frame::new().fill(bg()).inner_margin(Margin::symmetric(20, 14)))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Your stats")
-                                .font(theme::bold(26.0))
-                                .color(theme::text()),
-                        );
-                        ui.horizontal_wrapped(|ui| {
-                            for p in stats::Period::ALL {
-                                let style = if p == period {
-                                    ButtonStyle::Accent
-                                } else {
-                                    ButtonStyle::Ghost
-                                };
-                                if widgets::button(ui, p.name(), style, 13.0).clicked() {
-                                    period = p;
-                                }
+                if hovering_files {
+                    let rect = ui.max_rect();
+                    ui.painter().rect(
+                        rect,
+                        CornerRadius::same(12),
+                        theme::accent_soft(),
+                        Stroke::new(2.0, theme::accent()),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Drop the folder from Spotify here to import it",
+                        theme::bold(20.0),
+                        theme::text(),
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.label(RichText::new("Your stats").font(theme::bold(26.0)).color(theme::text()));
+                    ui.horizontal_wrapped(|ui| {
+                        for p in stats::Period::ALL {
+                            let style = if p == period {
+                                ButtonStyle::Accent
+                            } else {
+                                ButtonStyle::Ghost
+                            };
+                            if widgets::button(ui, p.name(), style, 13.0).clicked() {
+                                period = p;
                             }
-                        });
-                        ui.add_space(12.0);
-                        if view.plays.is_empty() || sum.plays == 0 {
-                            ui.label(
+                        }
+                    });
+                    ui.add_space(12.0);
+                    if sum.total_ms == 0 {
+                        ui.label(
                             RichText::new(
-                                "Nothing here yet. Play some music and come back: a song counts \
-                                 once you have listened to it for 30 seconds.",
+                                "Nothing here yet for this time. Play some music and come back \
+                                 (a song counts once you have listened to it for 30 seconds), \
+                                 or import your whole Spotify history below.",
                             )
                             .color(subdued()),
                         );
-                            return;
-                        }
-
-                        // Big numbers.
-                        ui.horizontal_wrapped(|ui| {
-                            let tiles = [
-                                (stats::format_duration(sum.total_ms), "listening"),
-                                (sum.plays.to_string(), "songs played"),
-                                (sum.songs.to_string(), "different songs"),
-                                (sum.artists.to_string(), "different artists"),
-                            ];
-                            for (number, label) in tiles {
-                                stat_tile(ui, &number, label);
-                            }
-                        });
-                        ui.add_space(14.0);
-
-                        ui.columns(2, |cols| {
-                            section_title(&mut cols[0], "Top songs");
-                            ranked_list(&mut cols[0], &sum.top_songs);
-                            section_title(&mut cols[1], "Top artists");
-                            ranked_list(&mut cols[1], &sum.top_artists);
-                        });
-                        ui.add_space(10.0);
-
-                        section_title(ui, "When you listen");
-                        ui.label(RichText::new("By hour of the day").small().color(muted()));
-                        let hours: Vec<(String, u64)> = sum
-                            .by_hour
-                            .iter()
-                            .enumerate()
-                            .map(|(h, ms)| {
-                                (
-                                    if h % 3 == 0 {
-                                        h.to_string()
-                                    } else {
-                                        String::new()
-                                    },
-                                    *ms,
-                                )
-                            })
-                            .collect();
-                        bar_chart(ui, &hours, 110.0);
-                        ui.add_space(10.0);
-                        let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-                        let weekdays: Vec<(String, u64)> = days
-                            .iter()
-                            .zip(sum.by_weekday)
-                            .map(|(d, ms)| (d.to_string(), ms))
-                            .collect();
-                        bar_chart(ui, &weekdays, 90.0);
-                        ui.add_space(16.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                            RichText::new(
-                                "Your history is kept only on this computer, in history.jsonl in \
-                                 the settings folder.",
-                            )
+                    } else {
+                        stats_overview(ui, sum);
+                    }
+                    ui.add_space(14.0);
+                    import_card(ui, importing, &mut pick);
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let since = sum
+                            .first_listen
+                            .as_ref()
+                            .map(|d| format!(" Your history goes back to {d}."))
+                            .unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!(
+                                "Your history is kept only on this computer, in the settings folder.{since}"
+                            ))
                             .small()
                             .color(muted()),
                         );
-                            if widgets::button(ui, "Clear history", ButtonStyle::Ghost, 12.0)
-                                .clicked()
-                            {
-                                clear = true;
-                            }
-                        });
+                        if widgets::button(ui, "Clear history", ButtonStyle::Ghost, 12.0)
+                            .on_hover_text("Deletes the history this app kept and the imported one")
+                            .clicked()
+                        {
+                            clear = true;
+                        }
                     });
+                });
             });
+        if pick {
+            self.pick_import_folder();
+        }
         if clear {
             stats::clear();
             self.stats = None;
             self.show_stats(period);
             self.notify("Your listening history is cleared.");
-        } else if period != view.period {
+        } else if self.stats.as_ref().is_some_and(|v| v.period != period) {
             self.show_stats(period);
         }
     }
@@ -2320,6 +2516,25 @@ impl App {
                                 }
                             }
                         });
+                    });
+
+                    settings_card(ui, "Album covers", |ui| {
+                        if ui
+                            .checkbox(&mut self.config.thumbnails, "Show small album covers in song lists")
+                            .changed()
+                        {
+                            self.config.save();
+                            self.thumbs.set_enabled(self.config.thumbnails);
+                        }
+                        ui.label(
+                            RichText::new(
+                                "In playlists, search results, Up next and your top artists and albums. \
+                                 Covers are only downloaded for what is on screen and use a few MB \
+                                 of memory at most; off, they use none.",
+                            )
+                            .small()
+                            .color(muted()),
+                        );
                     });
 
                     settings_card(ui, "Fun tab", |ui| {
@@ -2509,11 +2724,14 @@ impl App {
                             format!("Signed in as {}", self.user_name)
                         };
                         ui.label(RichText::new(who).color(theme::text()));
-                        if !self.can_edit_playlists && !self.user_id.is_empty() {
+                        if (!self.can_edit_playlists || !self.can_read_history) && !self.user_id.is_empty() {
                             ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new("To make playlists and save songs to Liked Songs, sign in once more.")
+                                    RichText::new(
+                                        "To use everything (playlists, Liked Songs, your top songs and \
+                                         stats from other devices), sign in once more.",
+                                    )
                                         .color(subdued()),
                                 );
                                 if widgets::button(ui, "Sign in again", ButtonStyle::Accent, 13.0).clicked() {
@@ -2790,34 +3008,37 @@ fn step(ui: &mut Ui, number: u32, add_contents: impl FnOnce(&mut Ui)) {
     ui.add_space(6.0);
 }
 
-/// A coloured tile for a quick search.
-fn mood_chip(ui: &mut Ui, text: &str) -> egui::Response {
-    const COLORS: [Color32; 7] = [
-        Color32::from_rgb(0x8c, 0x3b, 0x5e),
-        Color32::from_rgb(0x2d, 0x5d, 0x8a),
-        Color32::from_rgb(0x2f, 0x6e, 0x55),
-        Color32::from_rgb(0x8a, 0x5a, 0x2b),
-        Color32::from_rgb(0x5b, 0x46, 0x8f),
-        Color32::from_rgb(0x8a, 0x35, 0x35),
-        Color32::from_rgb(0x2e, 0x6f, 0x77),
-    ];
-    let hash = text
-        .bytes()
-        .fold(3usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
-    let color = COLORS[hash % COLORS.len()];
-    let (rect, response) = ui.allocate_exact_size(vec2(150.0, 64.0), Sense::click());
-    let fill = if response.hovered() {
-        color.gamma_multiply(1.25)
-    } else {
-        color
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(10), fill);
-    ui.painter().text(
-        rect.left_top() + vec2(14.0, 12.0),
-        egui::Align2::LEFT_TOP,
-        text,
-        theme::bold(16.0),
-        Color32::WHITE,
+/// An artist or album tile: a picture (round for artists) with the name under it.
+fn tile(
+    ui: &mut Ui,
+    thumb: Option<&egui::TextureHandle>,
+    icon: Icon,
+    title: &str,
+    subtitle: &str,
+    round: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(120.0, 156.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), hover());
+    }
+    let picture = Rect::from_min_size(rect.min + vec2(10.0, 8.0), Vec2::splat(100.0));
+    let radius = if round { 50 } else { 6 };
+    widgets::paint_cover(ui, picture, thumb, icon, radius);
+    let text = Rect::from_min_max(
+        pos2(rect.left() + 6.0, picture.bottom() + 6.0),
+        rect.max - vec2(6.0, 0.0),
+    );
+    widgets::place(
+        ui,
+        egui::UiBuilder::new()
+            .max_rect(text)
+            .layout(Layout::top_down(Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add(egui::Label::new(RichText::new(title).color(theme::text())).truncate());
+            ui.add(egui::Label::new(RichText::new(subtitle).small().color(subdued())).truncate());
+        },
     );
     response
 }
@@ -2840,7 +3061,195 @@ fn filter_box(ui: &mut Ui, filter: &mut String, width: f32) {
     widgets::paint_icon(ui.painter(), rect, Icon::Search, subdued());
 }
 
+/// The numbers, top lists and charts of the Stats tab.
+fn stats_overview(ui: &mut Ui, sum: &stats::Summary) {
+    let minutes = sum.total_ms / 60_000;
+    let per_day = sum.total_ms / sum.days.max(1) as u64;
+    let mut tiles = vec![
+        (stats::format_count(minutes), "minutes listened".to_string()),
+        (
+            stats::format_duration(sum.total_ms),
+            "listening time".to_string(),
+        ),
+        (
+            stats::format_count(sum.plays as u64),
+            "songs played".to_string(),
+        ),
+        (
+            stats::format_count(sum.songs as u64),
+            "different songs".to_string(),
+        ),
+        (
+            stats::format_count(sum.artists as u64),
+            "different artists".to_string(),
+        ),
+        (
+            stats::format_count(sum.albums as u64),
+            "different albums".to_string(),
+        ),
+        (
+            stats::format_count(sum.days as u64),
+            "days with music".to_string(),
+        ),
+        (
+            stats::format_duration(per_day),
+            "a day on average".to_string(),
+        ),
+        (
+            format!("{} days", sum.longest_streak),
+            "longest streak in a row".to_string(),
+        ),
+        (
+            format!("{} days", sum.current_streak),
+            "current streak".to_string(),
+        ),
+    ];
+    if let Some(new) = sum.new_artists {
+        tiles.push((
+            stats::format_count(new as u64),
+            "new artists discovered".to_string(),
+        ));
+    }
+    let favourite_hour = (0..24).max_by_key(|h| sum.by_hour[*h]).unwrap_or(0);
+    tiles.push((
+        format!("{favourite_hour}:00"),
+        "your favourite hour".to_string(),
+    ));
+    // As many tiles per row as fit.
+    let tile = STAT_TILE_WIDTH + 36.0 + ui.spacing().item_spacing.x;
+    let per_row = ((ui.available_width() + ui.spacing().item_spacing.x) / tile)
+        .floor()
+        .max(1.0) as usize;
+    for row in tiles.chunks(per_row) {
+        ui.horizontal(|ui| {
+            for (number, label) in row {
+                stat_tile(ui, number, label);
+            }
+        });
+    }
+    if let Some((day, ms)) = &sum.busiest_day {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "Your biggest day: {day}, with {} of music.",
+                stats::format_duration(*ms)
+            ))
+            .color(subdued()),
+        );
+    }
+    ui.add_space(14.0);
+
+    section_title(ui, "Listening over time");
+    bar_chart(ui, &sum.timeline, 110.0);
+    ui.add_space(10.0);
+
+    let lists: [(&str, &[stats::Ranked]); 3] = [
+        ("Top songs", &sum.top_songs),
+        ("Top artists", &sum.top_artists),
+        ("Top albums", &sum.top_albums),
+    ];
+    let per_row = if ui.available_width() > 900.0 { 3 } else { 2 };
+    for row in lists.chunks(per_row) {
+        ui.columns(per_row, |cols| {
+            for ((title, list), col) in row.iter().zip(cols.iter_mut()) {
+                section_title(col, title);
+                if list.is_empty() && *title == "Top albums" {
+                    col.label(
+                        RichText::new(
+                            "Albums show up for songs played from now on, or from an \
+                             extended history import.",
+                        )
+                        .small()
+                        .color(muted()),
+                    );
+                }
+                ranked_list(col, list);
+            }
+        });
+    }
+    ui.add_space(10.0);
+
+    section_title(ui, "When you listen");
+    ui.label(RichText::new("By hour of the day").small().color(muted()));
+    let hours: Vec<(String, u64)> = sum
+        .by_hour
+        .iter()
+        .enumerate()
+        .map(|(h, ms)| {
+            (
+                if h % 3 == 0 {
+                    h.to_string()
+                } else {
+                    String::new()
+                },
+                *ms,
+            )
+        })
+        .collect();
+    bar_chart(ui, &hours, 100.0);
+    ui.add_space(10.0);
+    ui.label(RichText::new("By day of the week").small().color(muted()));
+    let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let weekdays: Vec<(String, u64)> = days
+        .iter()
+        .zip(sum.by_weekday)
+        .map(|(d, ms)| (d.to_string(), ms))
+        .collect();
+    bar_chart(ui, &weekdays, 80.0);
+}
+
+/// How to import the listening history from Spotify's data download.
+fn import_card(ui: &mut Ui, importing: bool, pick: &mut bool) {
+    settings_card(ui, "Add your whole Spotify history", |ui| {
+        ui.label(
+            RichText::new(
+                "Spotify doesn't let apps read how long you have listened, but you can ask \
+                 Spotify for your own data and import it here. Your minutes, top songs and \
+                 artists then go back years.",
+            )
+            .color(subdued()),
+        );
+        ui.add_space(6.0);
+        step(ui, 1, |ui| {
+            ui.label("Open");
+            ui.hyperlink_to(
+                "spotify.com/account/privacy",
+                "https://www.spotify.com/account/privacy/",
+            );
+            ui.label("and request \"Extended streaming history\" (all years, can take a few weeks) or \"Account data\" (last year, a few days).");
+        });
+        step(ui, 2, |ui| {
+            ui.label("Spotify emails you a zip file. Right-click it and choose \"Extract All\".");
+        });
+        step(ui, 3, |ui| {
+            if crate::files::CAN_PICK {
+                ui.label("Click Import and choose the extracted folder, or drag the folder onto this window.");
+            } else {
+                ui.label("Drag the extracted folder onto this window.");
+            }
+        });
+        ui.horizontal(|ui| {
+            if importing {
+                ui.add(egui::Spinner::new().size(16.0).color(theme::accent()));
+                ui.label(RichText::new("Importing…").color(theme::text()));
+            } else if crate::files::CAN_PICK
+                && widgets::button(ui, "Import Spotify data…", ButtonStyle::Accent, 13.0).clicked()
+            {
+                *pick = true;
+            }
+        });
+        ui.label(
+            RichText::new("Importing the same files again does not count them twice.")
+                .small()
+                .color(muted()),
+        );
+    });
+}
+
 /// A big number with a label under it, on the Stats tab.
+/// Width of a stat tile's text; the whole tile is 36 pixels wider.
+const STAT_TILE_WIDTH: f32 = 128.0;
+
 fn stat_tile(ui: &mut Ui, number: &str, label: &str) {
     Frame::new()
         .fill(surface())
@@ -2849,13 +3258,16 @@ fn stat_tile(ui: &mut Ui, number: &str, label: &str) {
         .inner_margin(Margin::symmetric(18, 12))
         .show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.set_min_width(130.0);
-                ui.label(
-                    RichText::new(number)
-                        .font(theme::bold(24.0))
-                        .color(theme::accent()),
+                ui.set_width(STAT_TILE_WIDTH);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(number)
+                            .font(theme::bold(22.0))
+                            .color(theme::accent()),
+                    )
+                    .truncate(),
                 );
-                ui.label(RichText::new(label).color(subdued()));
+                ui.add(egui::Label::new(RichText::new(label).color(subdued())).truncate());
             });
         });
 }
@@ -2971,14 +3383,20 @@ fn empty_hint(ui: &mut Ui, empty: bool, text: &str) {
 }
 
 /// An album, playlist or podcast in the search results.
-fn result_row(ui: &mut Ui, icon: Icon, title: &str, subtitle: &str) -> egui::Response {
+fn result_row(
+    ui: &mut Ui,
+    icon: Icon,
+    thumb: Option<egui::TextureHandle>,
+    title: &str,
+    subtitle: &str,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(6), hover());
     }
     let tile = Rect::from_min_size(rect.min + vec2(6.0, 6.0), Vec2::splat(36.0));
-    widgets::paint_cover(ui, tile, None, icon, 6);
+    widgets::paint_cover(ui, tile, thumb.as_ref(), icon, 6);
     let text = Rect::from_min_max(
         pos2(tile.right() + 10.0, rect.top() + 6.0),
         pos2(rect.right() - 6.0, rect.bottom() - 6.0),

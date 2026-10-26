@@ -13,9 +13,12 @@ pub enum TrayCmd {
     Quit,
 }
 
-/// The logo (an amber rounded square with equaliser bars) as RGBA pixels.
-pub fn icon_rgba(size: u32) -> Vec<u8> {
-    const ACCENT: [u8; 3] = [0xff, 0xb0, 0x2e];
+/// The logo's normal colour.
+pub const AMBER: [u8; 3] = [0xff, 0xb0, 0x2e];
+
+/// The logo (a rounded square in `color` with equaliser bars) as RGBA pixels.
+pub fn icon_rgba(size: u32, color: [u8; 3]) -> Vec<u8> {
+    let accent = color;
     const BARS: [u8; 3] = [0x14, 0x16, 0x1d];
     let s = size as f32;
     let radius = s * 0.22;
@@ -60,9 +63,9 @@ pub fn icon_rgba(size: u32) -> Vec<u8> {
                     .unwrap_or(0) as u8
             };
             out.extend([
-                mix(ACCENT[0], BARS[0]),
-                mix(ACCENT[1], BARS[1]),
-                mix(ACCENT[2], BARS[2]),
+                mix(accent[0], BARS[0]),
+                mix(accent[1], BARS[1]),
+                mix(accent[2], BARS[2]),
                 (square * 255 / 16) as u8,
             ]);
         }
@@ -77,7 +80,7 @@ mod imp {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-    use super::{TrayCmd, icon_rgba};
+    use super::{AMBER, TrayCmd, icon_rgba};
 
     pub struct Tray {
         _icon: TrayIcon,
@@ -143,7 +146,7 @@ mod imp {
                     on_cmd(TrayCmd::Show);
                 }
             }));
-            let icon = tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32)?;
+            let icon = tray_icon::Icon::from_rgba(icon_rgba(32, AMBER), 32, 32)?;
             let tray = TrayIconBuilder::new()
                 .with_tooltip("lite-spotify")
                 .with_icon(icon)
@@ -151,6 +154,13 @@ mod imp {
                 .with_menu_on_left_click(false)
                 .build()?;
             Ok(Self { _icon: tray })
+        }
+
+        /// Recolours the icon (it follows the accent colour).
+        pub fn set_color(&self, color: [u8; 3]) {
+            if let Ok(icon) = tray_icon::Icon::from_rgba(icon_rgba(32, color), 32, 32) {
+                let _ = self._icon.set_icon(Some(icon));
+            }
         }
 
         /// Shows the song in the icon's tooltip.
@@ -173,5 +183,6 @@ mod imp {
             None
         }
         pub fn set_tooltip(&self, _text: &str) {}
+        pub fn set_color(&self, _color: [u8; 3]) {}
     }
 }

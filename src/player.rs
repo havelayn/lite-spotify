@@ -106,6 +106,12 @@ enum Cmd {
         play: bool,
     },
     Preload(String),
+    /// Play `length_ms` of a track from `position_ms`, then pause (Guess the Song).
+    Snippet {
+        uri: String,
+        position_ms: u32,
+        length_ms: u32,
+    },
     Play,
     Pause,
     Seek(u32),
@@ -208,6 +214,15 @@ impl PlayerCtl {
             play: false,
         });
     }
+    /// Plays a short part of a track and pauses by itself. The pause is timed
+    /// in the player, so even a tenth of a second is about right.
+    pub fn snippet(&self, uri: &str, position_ms: u32, length_ms: u32) {
+        self.send(Cmd::Snippet {
+            uri: uri.to_string(),
+            position_ms,
+            length_ms,
+        });
+    }
     pub fn preload(&self, uri: &str) {
         self.send(Cmd::Preload(uri.to_string()));
     }
@@ -279,6 +294,39 @@ impl PlayerCtl {
         })
     }
 
+    /// The songs on Spotify's Top 50 charts: the global one first, then those
+    /// of many countries. Each chart is handed to `on_chart` as it loads.
+    /// Charts that can't be read are skipped.
+    pub async fn chart_tracks(&self, mut on_chart: impl FnMut(Vec<Track>)) -> Result<()> {
+        let session = self.session()?;
+        let mut seen = std::collections::HashSet::new();
+        for id in CHARTS {
+            let Ok(uri) = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")) else {
+                continue;
+            };
+            let playlist = match SpPlaylist::get(&session, &uri).await {
+                Ok(p) => p,
+                Err(e) => {
+                    log::info!("Chart {id} could not be read: {e}");
+                    continue;
+                }
+            };
+            let uris: Vec<SpotifyUri> = playlist
+                .tracks()
+                .filter(|u| seen.insert(u.to_uri()))
+                .cloned()
+                .collect();
+            let tracks = tracks_from_uris(&session, uris).await;
+            if !tracks.is_empty() {
+                on_chart(tracks);
+            }
+        }
+        if seen.is_empty() {
+            return Err(anyhow!("Spotify did not let lite-spotify read its charts"));
+        }
+        Ok(())
+    }
+
     /// Songs similar to `seed_uri`, from Spotify's own autoplay radio (the same
     /// list the Spotify app plays when an album or playlist ends). Songs in
     /// `skip` are left out.
@@ -306,6 +354,33 @@ impl PlayerCtl {
     }
 }
 
+/// Spotify's own chart playlists: Top 50 Global, Today's Top Hits, Viral 50
+/// Global, then the Top 50 of many countries.
+const CHARTS: [&str; 22] = [
+    "37i9dQZEVXbMDoHDwVN2tF",
+    "37i9dQZF1DXcBWIGoYBM5M",
+    "37i9dQZEVXbLiRSasKsNU9",
+    "37i9dQZEVXbLRQDuF5jeBp",
+    "37i9dQZEVXbLnolsZ8PSNw",
+    "37i9dQZEVXbKCF6dqVpDkS",
+    "37i9dQZEVXbJiZcmkrIHGU",
+    "37i9dQZEVXbIPWwFssbupI",
+    "37i9dQZEVXbNFJfN1Vw8d9",
+    "37i9dQZEVXbIQnj7RRhdSX",
+    "37i9dQZEVXbMXbN3EUUhlg",
+    "37i9dQZEVXbO3qyFxbkOE1",
+    "37i9dQZEVXbKj23U1GF4IR",
+    "37i9dQZEVXbJPcfkRz0wJ0",
+    "37i9dQZEVXbLoATJ81JYXz",
+    "37i9dQZEVXbKXQ4mDTEBXq",
+    "37i9dQZEVXbLZ52XmnySJg",
+    "37i9dQZEVXbNBz9cRCSFkY",
+    "37i9dQZEVXbMMy2roB9myp",
+    "37i9dQZEVXbJNSeeHswcKB",
+    "37i9dQZEVXbN6itCcaL3Tt",
+    "37i9dQZEVXbObFQZ3JLcXt",
+];
+
 /// Looks up song details through the player's connection, a few at a time.
 /// Songs that can't be looked up are left out; the order is kept.
 async fn tracks_from_uris(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track> {
@@ -324,6 +399,12 @@ async fn tracks_from_uris(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track
                 .find(|i| i.size == ImageSize::DEFAULT)
                 .or(t.album.covers.first())
                 .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
+            let thumb_url = t
+                .album
+                .covers
+                .iter()
+                .find(|i| i.size == ImageSize::SMALL)
+                .map(|i| format!("https://i.scdn.co/image/{}", i.id.to_base16()));
             Track {
                 uri: t.id.to_uri(),
                 name: t.name,
@@ -335,6 +416,8 @@ async fn tracks_from_uris(session: &Session, uris: Vec<SpotifyUri>) -> Vec<Track
                 playable: true,
                 is_episode: false,
                 added_at: String::new(),
+                album_id: t.album.id.to_id(),
+                thumb_url,
             }
         })
         .collect()
@@ -461,10 +544,27 @@ async fn run(
         move || backend(None, AudioFormat::default()),
     );
 
+    // The snippet waiting to start playing: its track and length.
+    let snippet: Arc<Mutex<Option<(String, u32)>>> = Arc::new(Mutex::new(None));
     let mut events = player.get_player_event_channel();
     let events_notify = notify.clone();
+    let (snippet_events, snippet_player) = (snippet.clone(), player.clone());
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            if let PlayerEvent::Playing { track_id, .. } = &event {
+                let uri = track_id.to_uri();
+                let mut pending = snippet_events.lock().unwrap();
+                if pending.as_ref().is_some_and(|(u, _)| *u == uri)
+                    && let Some((_, length_ms)) = pending.take()
+                {
+                    let player = snippet_player.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(length_ms as u64))
+                            .await;
+                        player.pause();
+                    });
+                }
+            }
             if let Some(msg) = translate(event) {
                 events_notify(msg);
             }
@@ -519,6 +619,17 @@ async fn run(
                     Err(_) => notify(PlayerMsg::Unavailable { uri }),
                 }
             }
+            Cmd::Snippet {
+                uri,
+                position_ms,
+                length_ms,
+            } => match SpotifyUri::from_uri(&uri) {
+                Ok(id) => {
+                    *snippet.lock().unwrap() = Some((uri, length_ms));
+                    player.load(id, true, position_ms);
+                }
+                Err(_) => notify(PlayerMsg::Unavailable { uri }),
+            },
             Cmd::Preload(uri) => {
                 if let Ok(id) = SpotifyUri::from_uri(&uri) {
                     player.preload(id);

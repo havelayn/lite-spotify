@@ -350,13 +350,20 @@ impl Fun {
                 .selected_text(current)
                 .width(260.0)
                 .show_ui(ui, |ui| {
-                    let liked = TrackSource::LikedSongs;
-                    if ui
-                        .selectable_label(self.pool_source == liked, "Liked Songs")
-                        .clicked()
-                    {
-                        actions.push(FunAction::LoadPool(liked));
+                    for source in [
+                        TrackSource::LikedSongs,
+                        TrackSource::Popular,
+                        TrackSource::AnySong,
+                    ] {
+                        let selected = self.pool_source == source;
+                        if ui
+                            .selectable_label(selected, source_name(&source))
+                            .clicked()
+                        {
+                            actions.push(FunAction::LoadPool(source));
+                        }
                     }
+                    ui.separator();
                     for p in playlists {
                         let source = TrackSource::Playlist {
                             id: p.id.clone(),
@@ -516,6 +523,8 @@ pub fn source_name(source: &TrackSource) -> String {
         TrackSource::Playlist { name, .. }
         | TrackSource::Album { name, .. }
         | TrackSource::Show { name, .. } => name.clone(),
+        TrackSource::Popular => "Popular right now (Spotify's charts)".into(),
+        TrackSource::AnySong => "Any song on Spotify".into(),
     }
 }
 

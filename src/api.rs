@@ -37,9 +37,13 @@ pub struct Track {
     /// When the user saved it (Liked Songs) or added it to the playlist, as
     /// "YYYY-MM-DD…". Empty when unknown.
     pub added_at: String,
+    /// The album's Spotify id, to open it. Empty for episodes.
+    pub album_id: String,
+    /// The smallest cover, for thumbnails in lists.
+    pub thumb_url: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Playlist {
     pub id: String,
     pub name: String,
@@ -47,6 +51,8 @@ pub struct Playlist {
     /// Spotify user id of the owner, to know which playlists the user may change.
     pub owner_id: String,
     pub total: u32,
+    /// Small cover, for thumbnails.
+    pub image_url: Option<String>,
 }
 
 /// Who is signed in.
@@ -56,19 +62,68 @@ pub struct Me {
     pub name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Album {
     pub id: String,
     pub name: String,
     pub artists: String,
+    /// Small cover, for thumbnails.
+    pub image_url: Option<String>,
+}
+
+/// One of the user's most played artists.
+#[derive(Clone, Debug, Default)]
+pub struct Artist {
+    pub name: String,
+    /// Small picture, for thumbnails.
+    pub image_url: Option<String>,
+}
+
+/// How far back "top" songs and artists go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TopRange {
+    /// About the last four weeks.
+    Month,
+    /// About the last six months.
+    HalfYear,
+    /// About the last year.
+    Year,
+}
+
+impl TopRange {
+    pub const ALL: [TopRange; 3] = [TopRange::Month, TopRange::HalfYear, TopRange::Year];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TopRange::Month => "Last 4 weeks",
+            TopRange::HalfYear => "Last 6 months",
+            TopRange::Year => "Last year",
+        }
+    }
+
+    fn api_name(self) -> &'static str {
+        match self {
+            TopRange::Month => "short_term",
+            TopRange::HalfYear => "medium_term",
+            TopRange::Year => "long_term",
+        }
+    }
+}
+
+/// A song from "recently played", with when it was played (seconds since 1970).
+pub struct RecentPlay {
+    pub track: Track,
+    pub played_at: i64,
 }
 
 /// A podcast.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Show {
     pub id: String,
     pub name: String,
     pub publisher: String,
+    /// Small cover, for thumbnails.
+    pub image_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -96,6 +151,10 @@ pub enum TrackSource {
         id: String,
         name: String,
     },
+    /// The songs on Spotify's Top 50 charts (for the Fun tab).
+    Popular,
+    /// Random songs from all of Spotify (for the Fun tab).
+    AnySong,
 }
 
 /// An HTTP error answer from the Web API.
@@ -249,8 +308,18 @@ impl WebApi {
     /// Whether the login allows changing playlists and Liked Songs (logins from
     /// older versions don't).
     pub async fn can_edit(&self) -> bool {
+        self.has_scopes(auth::EDIT_SCOPES).await
+    }
+
+    /// Whether the login allows reading top songs and recently played songs
+    /// (logins from before 0.8.0 don't).
+    pub async fn can_read_history(&self) -> bool {
+        self.has_scopes(auth::HISTORY_SCOPES).await
+    }
+
+    async fn has_scopes(&self, scopes: &[&str]) -> bool {
         let tokens = self.tokens.lock().await;
-        auth::EDIT_SCOPES
+        scopes
             .iter()
             .all(|s| tokens.scope.split(' ').any(|g| g == *s))
     }
@@ -377,6 +446,10 @@ impl WebApi {
         // "market=from_token" makes Spotify say whether each track can be played in
         // the user's country. The `next` links Spotify returns keep the parameter.
         let (mut next, parent) = match source {
+            TrackSource::AnySong => return self.random_tracks(max.min(150), on_page).await,
+            TrackSource::Popular => {
+                return Err(anyhow!("The charts are loaded through the player"));
+            }
             TrackSource::LikedSongs => (
                 Some(format!("{API}/me/tracks?limit=50&market=from_token")),
                 None,
@@ -426,6 +499,54 @@ impl WebApi {
             count += tracks.len();
             on_page(tracks);
             next = if count >= max { None } else { page.next };
+        }
+        Ok(())
+    }
+
+    /// Random songs from all of Spotify: searches for a random letter and
+    /// starts somewhere random in the results, ten songs at a time.
+    async fn random_tracks(&self, max: usize, mut on_page: impl FnMut(Vec<Track>)) -> Result<()> {
+        use rand::Rng;
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0;
+        let mut failures = 0;
+        while count < max && failures < 5 {
+            let (letter, offset) = {
+                let mut rng = rand::rng();
+                let letter = (b'a' + rng.random_range(0..26u8)) as char;
+                (letter.to_string(), rng.random_range(0..100u32) * 10)
+            };
+            let offset = offset.to_string();
+            let raw: Result<RawSearch> = self
+                .get(
+                    "/search",
+                    &[
+                        ("q", letter.as_str()),
+                        ("type", "track"),
+                        ("limit", SEARCH_LIMIT),
+                        ("offset", offset.as_str()),
+                        ("market", "from_token"),
+                    ],
+                )
+                .await;
+            let Ok(raw) = raw else {
+                failures += 1;
+                continue;
+            };
+            let tracks: Vec<Track> = raw
+                .tracks
+                .map(|p| {
+                    parse_items::<RawTrack>(p.items)
+                        .filter_map(|t| t.into_track(None))
+                        .filter(|t| t.playable && seen.insert(t.uri.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            count += tracks.len();
+            on_page(tracks);
+        }
+        if count == 0 {
+            return Err(anyhow!("Spotify's search did not answer"));
         }
         Ok(())
     }
@@ -487,6 +608,49 @@ impl WebApi {
         Ok(out)
     }
 
+    /// The user's most played songs.
+    pub async fn top_tracks(&self, range: TopRange) -> Result<Vec<Track>> {
+        let page: Paging = self
+            .get(
+                "/me/top/tracks",
+                &[("limit", "50"), ("time_range", range.api_name())],
+            )
+            .await?;
+        Ok(parse_items::<RawTrack>(page.items)
+            .filter_map(|t| t.into_track(None))
+            .collect())
+    }
+
+    /// The user's most played artists.
+    pub async fn top_artists(&self, range: TopRange) -> Result<Vec<Artist>> {
+        let page: Paging = self
+            .get(
+                "/me/top/artists",
+                &[("limit", "30"), ("time_range", range.api_name())],
+            )
+            .await?;
+        Ok(parse_items::<RawArtist>(page.items)
+            .map(|a| Artist {
+                image_url: thumb_image(&a.images),
+                name: a.name,
+            })
+            .collect())
+    }
+
+    /// The last 50 songs played on any device.
+    pub async fn recently_played(&self) -> Result<Vec<RecentPlay>> {
+        let page: Paging = self
+            .get("/me/player/recently-played", &[("limit", "50")])
+            .await?;
+        Ok(parse_items::<RawRecent>(page.items)
+            .filter_map(|r| {
+                let played_at = r.played_at.parse::<jiff::Timestamp>().ok()?.as_second();
+                let track = r.track.into_track(None)?;
+                Some(RecentPlay { track, played_at })
+            })
+            .collect())
+    }
+
     /// Downloads an image (album covers are small JPEGs).
     pub async fn image(&self, url: &str) -> Result<Vec<u8>> {
         let response = self.http.get(url).send().await?.error_for_status()?;
@@ -515,6 +679,14 @@ pub fn join_names(names: impl IntoIterator<Item = String>) -> String {
 /// The year at the start of a Spotify date ("2011", "2011-05" or "2011-05-20").
 fn year_of(date: &str) -> u16 {
     date.get(..4).and_then(|y| y.parse().ok()).unwrap_or(0)
+}
+
+/// The smallest picture, for thumbnails (usually 64 pixels).
+fn thumb_image(images: &[RawImage]) -> Option<String> {
+    images
+        .iter()
+        .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+        .map(|i| i.url.clone())
 }
 
 /// Picks the smallest cover that is at least 300 pixels wide (Spotify's middle
@@ -572,6 +744,16 @@ struct RawImage {
 struct RawArtist {
     #[serde(default)]
     name: String,
+    /// Only on full artist objects (top artists).
+    #[serde(default)]
+    images: Vec<RawImage>,
+}
+
+#[derive(Deserialize)]
+struct RawRecent {
+    track: RawTrack,
+    #[serde(default)]
+    played_at: String,
 }
 
 /// An album, or a podcast show (they are read the same way).
@@ -595,6 +777,7 @@ struct RawAlbum {
 impl RawAlbum {
     fn into_album(self) -> Album {
         Album {
+            image_url: thumb_image(&self.images),
             id: self.id,
             name: self.name,
             artists: join_names(self.artists.into_iter().map(|a| a.name)),
@@ -644,6 +827,9 @@ impl RawTrack {
             let image_url = small_image(&self.images)
                 .or_else(|| parent.and_then(|p| small_image(&p.images)))
                 .or_else(|| self.show.as_ref().and_then(|s| small_image(&s.images)));
+            let thumb_url = thumb_image(&self.images)
+                .or_else(|| parent.and_then(|p| thumb_image(&p.images)))
+                .or_else(|| self.show.as_ref().and_then(|s| thumb_image(&s.images)));
             return Some(Track {
                 uri: self.uri,
                 name: self.name,
@@ -655,6 +841,8 @@ impl RawTrack {
                 playable,
                 is_episode: true,
                 added_at: String::new(),
+                album_id: String::new(),
+                thumb_url,
             });
         }
         let album = parent.or(self.album.as_ref());
@@ -669,6 +857,8 @@ impl RawTrack {
             is_episode: false,
             year: album.map(|a| year_of(&a.release_date)).unwrap_or(0),
             added_at: String::new(),
+            album_id: album.map(|a| a.id.clone()).unwrap_or_default(),
+            thumb_url: album.and_then(|a| thumb_image(&a.images)),
         })
     }
 }
@@ -694,6 +884,7 @@ struct RawShow {
 impl RawShow {
     fn into_show(self) -> Show {
         Show {
+            image_url: thumb_image(&self.images),
             id: self.id,
             name: self.name,
             publisher: self.publisher,
@@ -720,6 +911,8 @@ struct RawPlaylist {
     #[serde(default)]
     name: String,
     owner: Option<RawOwner>,
+    #[serde(default)]
+    images: Option<Vec<RawImage>>,
     // Renamed from "tracks" to "items" in 2026; accept both.
     items: Option<RawCount>,
     tracks: Option<RawCount>,
@@ -740,6 +933,7 @@ impl RawPlaylist {
                 .map(|o| o.display_name.unwrap_or(o.id))
                 .unwrap_or_default(),
             total: self.items.or(self.tracks).map(|c| c.total).unwrap_or(0),
+            image_url: self.images.as_deref().and_then(thumb_image),
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lite-spotify"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "Lightweight Spotify Premium player for Windows (egui + librespot)"
 license = "MIT"
@@ -61,6 +61,8 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_WinRT",
 ] }
+# Windows' "choose a folder" dialog, for importing Spotify's listening history.
+rfd = { version = "0.17", default-features = false }
 # The icon in the notification area (system tray).
 tray-icon = { version = "0.25", default-features = false }
 

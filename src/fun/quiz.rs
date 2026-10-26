@@ -14,8 +14,19 @@ use crate::widgets::{self, ButtonStyle, Icon};
 const RIGHT: Color32 = Color32::from_rgb(0x2e, 0xb8, 0x6b);
 const WRONG: Color32 = Color32::from_rgb(0xe0, 0x4f, 0x5f);
 
-/// Snippet lengths: the first listen, then two "+5 seconds".
-const LENGTHS_MS: [u32; 3] = [5_000, 10_000, 15_000];
+/// Snippet lengths: a tenth of a second first, then longer and longer.
+const LENGTHS_MS: [u32; 4] = [100, 1_000, 3_000, 5_000];
+/// Points for a right answer after each length: the quicker, the more.
+const POINTS: [u32; 4] = [10, 5, 3, 1];
+
+/// "0.1 seconds", "1 second", "3 seconds".
+fn seconds_text(ms: u32) -> String {
+    match ms {
+        1_000 => "1 second".to_string(),
+        ms if ms < 1_000 => format!("0.{} seconds", ms / 100),
+        ms => format!("{} seconds", ms / 1000),
+    }
+}
 
 struct Round {
     choices: Vec<Track>,
@@ -133,8 +144,8 @@ impl Quiz {
         });
         ui.label(
             RichText::new(
-                "Listen, then pick the right song. Guess after 5 seconds for 3 points, \
-                 after 10 for 2, after 15 for 1.",
+                "It starts with a tenth of a second! Guess right away for 10 points, after \
+                 1 second for 5, after 3 seconds for 3, after 5 seconds for 1.",
             )
             .color(subdued()),
         );
@@ -183,26 +194,31 @@ impl Quiz {
             ui.add_space(14.0);
             ui.vertical(|ui| {
                 ui.add_space(14.0);
-                let seconds = LENGTHS_MS[round.length] / 1000;
+                let seconds = seconds_text(LENGTHS_MS[round.length]);
                 let status = if self.waiting {
                     "Loading…".to_string()
                 } else if playing_progress.is_some() {
                     "Listen…".to_string()
                 } else {
-                    format!("Press play to hear {seconds} seconds")
+                    format!("Press play to hear {seconds}")
                 };
                 ui.label(
                     RichText::new(status)
                         .font(theme::bold(16.0))
                         .color(theme::text()),
                 );
-                if round.guessed.is_none()
-                    && round.length + 1 < LENGTHS_MS.len()
-                    && widgets::button(ui, "+5 seconds", ButtonStyle::Ghost, 13.0)
-                        .on_hover_text("Hear more, for fewer points")
+                if round.guessed.is_none() && round.length + 1 < LENGTHS_MS.len() {
+                    let next = round.length + 1;
+                    let label = format!("Play {}", seconds_text(LENGTHS_MS[next]));
+                    if widgets::button(ui, &label, ButtonStyle::Ghost, 13.0)
+                        .on_hover_text(format!(
+                            "Hear more of the song; a right answer is then worth {} points",
+                            POINTS[next]
+                        ))
                         .clicked()
-                {
-                    play_length = Some(round.length + 1);
+                    {
+                        play_length = Some(next);
+                    }
                 }
             });
         });
@@ -282,7 +298,7 @@ impl Quiz {
         }
         if let Some(guess) = round.guessed {
             let (text, color) = if guess == round.answer {
-                let points = 3 - round.length as u32;
+                let points = POINTS[round.length];
                 (format!("Right! +{points} points"), RIGHT)
             } else {
                 let name = &round.choices[round.answer].name;
@@ -306,7 +322,7 @@ impl Quiz {
         if let Some(guess) = picked {
             round.guessed = Some(guess);
             if guess == round.answer {
-                self.score += 3 - round.length as u32;
+                self.score += POINTS[round.length];
                 self.streak += 1;
                 self.best_streak = self.best_streak.max(self.streak);
             } else {

@@ -36,7 +36,25 @@ enum Msg {
     SignedIn(Arc<WebApi>, Option<String>),
     SignInFailed(String),
     NewRefreshToken(String),
-    Me(api::Me, bool),
+    /// Who is signed in, whether the login may change playlists and Liked
+    /// Songs, and whether it may read top and recently played songs.
+    Me(api::Me, bool, bool),
+    /// The user's top songs and artists.
+    Top {
+        range: api::TopRange,
+        result: Result<(Vec<Track>, Vec<api::Artist>), String>,
+    },
+    /// A thumbnail finished loading (`None` if it failed).
+    Thumb {
+        url: String,
+        image: Option<egui::ColorImage>,
+    },
+    /// Spotify's listening history was imported.
+    Imported(Result<stats::Imported, String>),
+    /// Songs from "recently played" were added to the stats.
+    RecentMerged(usize),
+    /// The user picked a folder to import.
+    ImportPicked(std::path::PathBuf),
     Playlists(Result<Vec<Playlist>, String>),
     Shows(Result<Vec<Show>, String>),
     TracksPage {
@@ -301,6 +319,14 @@ pub struct App {
     user_id: String,
     /// Whether the login allows making and changing playlists.
     can_edit_playlists: bool,
+    /// Whether the login allows reading top and recently played songs.
+    can_read_history: bool,
+    /// The top songs, artists and albums on the Search tab.
+    top: Option<TopView>,
+    /// Small covers for lists (when turned on in Settings).
+    thumbs: crate::thumbs::Thumbs,
+    /// An import of Spotify's listening history is running.
+    importing: bool,
     /// A request for similar songs is on its way.
     similar_loading: bool,
     /// Start playing the similar songs as soon as they arrive (the queue ran out).
@@ -365,9 +391,24 @@ pub struct App {
     /// The Connect song whose details are being looked up: uri, position, playing.
     remote_pending: Option<(String, u32, bool)>,
 
+    /// The accent colour and light/dark look the window and tray icon were
+    /// last given.
+    window_look: Option<([u8; 3], bool)>,
     /// The Discord status, while turned on.
     discord: Option<Discord>,
     discord_shown: Option<Presence>,
+}
+
+struct TopView {
+    range: api::TopRange,
+    loading: bool,
+    tracks: Vec<Track>,
+    artists: Vec<api::Artist>,
+    /// The albums of the top songs, most songs first.
+    albums: Vec<api::Album>,
+    error: Option<String>,
+    /// Show all 50 songs instead of the first 10.
+    show_all: bool,
 }
 
 struct StatsView {
@@ -468,6 +509,10 @@ impl App {
             copied_at: None,
             user_id: String::new(),
             can_edit_playlists: false,
+            can_read_history: false,
+            top: None,
+            thumbs: crate::thumbs::Thumbs::default(),
+            importing: false,
             similar_loading: false,
             similar_then_play: false,
             queue_id: 0,
@@ -499,7 +544,10 @@ impl App {
             remote_pending: None,
             discord: None,
             discord_shown: None,
+            window_look: None,
         };
+
+        app.thumbs.set_enabled(app.config.thumbnails);
 
         #[cfg(debug_assertions)]
         if let Ok(which) = std::env::var("LITE_SPOTIFY_DEMO") {
@@ -646,7 +694,33 @@ impl App {
         self.rt.spawn(async move {
             if let Ok(me) = api.me().await {
                 let can_edit = api.can_edit().await;
-                outbox.send(Msg::Me(me, can_edit));
+                let can_history = api.can_read_history().await;
+                outbox.send(Msg::Me(me, can_edit, can_history));
+                if can_history {
+                    // Songs played on other devices count for the stats too.
+                    match api.recently_played().await {
+                        Ok(recent) => {
+                            let plays = recent
+                                .into_iter()
+                                .filter(|r| !r.track.is_episode)
+                                .map(|r| stats::Play {
+                                    t: r.played_at,
+                                    uri: r.track.uri,
+                                    name: r.track.name,
+                                    artists: r.track.artists,
+                                    album: r.track.album,
+                                    ms: r.track.duration_ms as u64,
+                                })
+                                .collect();
+                            let added =
+                                tokio::task::spawn_blocking(move || stats::merge_recent(plays))
+                                    .await
+                                    .unwrap_or(0);
+                            outbox.send(Msg::RecentMerged(added));
+                        }
+                        Err(e) => log::info!("Could not read recently played songs: {e:#}"),
+                    }
+                }
             }
         });
         self.reload_playlists();
@@ -748,6 +822,18 @@ impl App {
         let outbox = self.outbox.clone();
         let player = self.player.clone();
         self.rt.spawn(async move {
+            if source == TrackSource::Popular {
+                let error = match &player {
+                    Some(player) => player
+                        .chart_tracks(|tracks| outbox.send(Msg::TracksPage { id, tracks }))
+                        .await
+                        .err()
+                        .map(|e| format!("{e:#}")),
+                    None => Some("The player is not connected yet.".into()),
+                };
+                outbox.send(Msg::TracksDone { id, error });
+                return;
+            }
             let mut got_any = false;
             let result = api
                 .tracks(&source, |tracks| {
@@ -890,7 +976,7 @@ impl App {
             self.now.playing = false;
             self.now.loading = false;
         }
-        player.load(&track.uri, start_ms);
+        player.snippet(&track.uri, start_ms, length_ms);
         self.quiz = Some(QuizSnippet {
             uri: track.uri.clone(),
             length_ms,
@@ -1458,6 +1544,7 @@ impl App {
             && ms >= stats::MIN_LISTEN_MS
         {
             stats::record(&stats::Play {
+                album: track.album,
                 t: jiff::Timestamp::now().as_second(),
                 uri: track.uri,
                 name: track.name,
@@ -1465,6 +1552,95 @@ impl App {
                 ms,
             });
         }
+    }
+
+    /// Loads the user's top songs and artists for the Search tab.
+    fn load_top(&mut self, range: api::TopRange) {
+        let Some(api) = self.api.clone() else { return };
+        let show_all = self.top.as_ref().is_some_and(|t| t.show_all);
+        self.top = Some(TopView {
+            range,
+            loading: true,
+            tracks: Vec::new(),
+            artists: Vec::new(),
+            albums: Vec::new(),
+            error: None,
+            show_all,
+        });
+        let outbox = self.outbox.clone();
+        self.rt.spawn(async move {
+            let result = async {
+                let tracks = api.top_tracks(range).await?;
+                let artists = api.top_artists(range).await?;
+                anyhow::Ok((tracks, artists))
+            }
+            .await
+            .map_err(|e| format!("{e:#}"));
+            outbox.send(Msg::Top { range, result });
+        });
+    }
+
+    fn on_top(
+        &mut self,
+        range: api::TopRange,
+        result: Result<(Vec<Track>, Vec<api::Artist>), String>,
+    ) {
+        let Some(top) = &mut self.top else { return };
+        if top.range != range {
+            return;
+        }
+        top.loading = false;
+        match result {
+            Ok((tracks, artists)) => {
+                // Albums: those with the most top songs first.
+                let mut albums: Vec<(api::Album, usize)> = Vec::new();
+                for t in &tracks {
+                    if t.album_id.is_empty() {
+                        continue;
+                    }
+                    match albums.iter_mut().find(|(a, _)| a.id == t.album_id) {
+                        Some((_, n)) => *n += 1,
+                        None => albums.push((
+                            api::Album {
+                                id: t.album_id.clone(),
+                                name: t.album.clone(),
+                                artists: t.artists.split(", ").next().unwrap_or("").to_string(),
+                                image_url: t.thumb_url.clone(),
+                            },
+                            1,
+                        )),
+                    }
+                }
+                albums.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                top.albums = albums.into_iter().map(|(a, _)| a).take(12).collect();
+                top.tracks = tracks;
+                top.artists = artists;
+            }
+            Err(e) => top.error = Some(e),
+        }
+    }
+
+    /// Imports Spotify's listening history from these files or folders.
+    fn start_import(&mut self, paths: Vec<std::path::PathBuf>) {
+        if self.importing || paths.is_empty() {
+            return;
+        }
+        self.importing = true;
+        let outbox = self.outbox.clone();
+        std::thread::spawn(move || {
+            let result = stats::import(&paths).map_err(|e| format!("{e:#}"));
+            outbox.send(Msg::Imported(result));
+        });
+    }
+
+    /// Asks for the folder with Spotify's data download (Windows), then imports it.
+    fn pick_import_folder(&mut self) {
+        let outbox = self.outbox.clone();
+        std::thread::spawn(move || {
+            if let Some(folder) = crate::files::pick_folder("Choose the folder from Spotify") {
+                outbox.send(Msg::ImportPicked(folder));
+            }
+        });
     }
 
     fn show_stats(&mut self, period: stats::Period) {
@@ -1511,6 +1687,25 @@ impl App {
         }
     }
 
+    /// Downloads the thumbnails that rows on screen asked for.
+    fn load_thumbs(&mut self) {
+        let Some(api) = self.api.clone() else { return };
+        for url in self.thumbs.take_requests() {
+            let (api, outbox) = (api.clone(), self.outbox.clone());
+            self.rt.spawn(async move {
+                let image = async {
+                    let bytes = api.image(&url).await.ok()?;
+                    let img = image::load_from_memory(&bytes).ok()?;
+                    let img = img.thumbnail(64, 64).to_rgba8();
+                    let size = [img.width() as usize, img.height() as usize];
+                    Some(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
+                }
+                .await;
+                outbox.send(Msg::Thumb { url, image });
+            });
+        }
+    }
+
     fn show_window(ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -1543,6 +1738,32 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.save_session();
+        }
+    }
+
+    /// Keeps the window's title bar (dark or light) and the app icon in the
+    /// taskbar, Task Manager and tray in the colours of the app's look.
+    fn update_window_look(&mut self, ctx: &egui::Context) {
+        let look = (theme::accent_rgb(), self.config.light_theme);
+        if self.window_look == Some(look) {
+            return;
+        }
+        self.window_look = Some(look);
+        let system_theme = if look.1 {
+            egui::SystemTheme::Light
+        } else {
+            egui::SystemTheme::Dark
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(system_theme));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(
+            egui::IconData {
+                rgba: crate::tray::icon_rgba(64, look.0),
+                width: 64,
+                height: 64,
+            },
+        ))));
+        if let Some(tray) = &self.tray {
+            tray.set_color(look.0);
         }
     }
 
@@ -1967,8 +2188,10 @@ impl App {
             match &msg {
                 PlayerMsg::Playing { uri, .. } if *uri == quiz.uri => {
                     if quiz.stop_at.is_none() {
-                        quiz.stop_at =
-                            Some(Instant::now() + Duration::from_millis(quiz.length_ms as u64));
+                        // The player pauses by itself; this is only a safety net.
+                        quiz.stop_at = Some(
+                            Instant::now() + Duration::from_millis(quiz.length_ms as u64 + 400),
+                        );
                         if let Some(fun) = &mut self.fun {
                             fun.quiz_started();
                         }
@@ -2076,7 +2299,8 @@ impl App {
                     self.config.refresh_token = Some(token);
                     self.config.save();
                 }
-                Msg::Me(me, can_edit) => {
+                Msg::Me(me, can_edit, can_history) => {
+                    self.can_read_history = can_history;
                     self.user_name = me.name;
                     self.user_id = me.id;
                     self.can_edit_playlists = can_edit;
@@ -2201,6 +2425,35 @@ impl App {
                     }
                 }
                 Msg::MediaKey(key) => self.on_media_key(key),
+                Msg::Top { range, result } => self.on_top(range, result),
+                Msg::Thumb { url, image } => self.thumbs.loaded(ctx, url, image),
+                Msg::ImportPicked(folder) => self.start_import(vec![folder]),
+                Msg::Imported(result) => {
+                    self.importing = false;
+                    match result {
+                        Ok(done) => {
+                            self.notify(format!(
+                                "Imported {} plays ({}) from {} file(s).",
+                                stats::format_count(done.plays as u64),
+                                stats::format_duration(done.ms),
+                                done.files
+                            ));
+                            // Show the new numbers.
+                            if let Some(view) = self.stats.take() {
+                                self.show_stats(view.period);
+                            }
+                        }
+                        Err(e) => self.notify(e),
+                    }
+                }
+                Msg::RecentMerged(added) => {
+                    if added > 0 {
+                        log::info!("Added {added} recently played songs to the stats");
+                        if let Some(view) = self.stats.take() {
+                            self.show_stats(view.period);
+                        }
+                    }
+                }
                 Msg::Tray(cmd) => self.on_tray(ctx, cmd),
                 Msg::RemoteTrack(track) => self.on_remote_track(track),
             }
@@ -2229,6 +2482,7 @@ impl App {
                 owner: "Demo".into(),
                 owner_id: "demo".into(),
                 total: 20,
+                image_url: None,
             })
             .collect();
         let artists = [
@@ -2250,6 +2504,8 @@ impl App {
                 is_episode: false,
                 year: 1965 + (i * 7 % 60) as u16,
                 added_at: format!("20{:02}-0{}-15T10:00:00Z", 12 + i % 13, 1 + i % 9),
+                album_id: String::new(),
+                thumb_url: None,
             })
             .collect();
         let source = TrackSource::Playlist {
@@ -2279,6 +2535,7 @@ impl App {
                 id: format!("show{i}"),
                 name: format!("Podcast number {i}"),
                 publisher: "Someone".into(),
+                image_url: None,
             })
             .collect();
         self.shows_loaded = true;
@@ -2295,6 +2552,7 @@ impl App {
                                 id: format!("album{i}"),
                                 name: format!("Album {i}"),
                                 artists: "Some Artist".into(),
+                                image_url: None,
                             })
                             .collect(),
                         playlists: self.playlists[..5].to_vec(),
@@ -2319,6 +2577,8 @@ impl App {
                             is_episode: true,
                             year: 2026,
                             added_at: String::new(),
+                            album_id: String::new(),
+                            thumb_url: None,
                         })
                         .collect(),
                     loading: false,
@@ -2373,7 +2633,39 @@ impl App {
                     download_url: String::new(),
                 });
             }
-            "search-empty" => self.tab = Tab::Search,
+            "search-empty" => {
+                self.tab = Tab::Search;
+                self.can_read_history = true;
+                let artists = [
+                    "Artist One",
+                    "The Twos",
+                    "Band Three",
+                    "Four Seasons",
+                    "Fifth Ave",
+                ];
+                self.top = Some(TopView {
+                    range: api::TopRange::HalfYear,
+                    loading: false,
+                    tracks: tracks[..20].to_vec(),
+                    artists: artists
+                        .iter()
+                        .map(|a| api::Artist {
+                            name: a.to_string(),
+                            image_url: None,
+                        })
+                        .collect(),
+                    albums: (1..=6)
+                        .map(|i| api::Album {
+                            id: format!("album{i}"),
+                            name: format!("Top album {i}"),
+                            artists: artists[i % 5].to_string(),
+                            image_url: None,
+                        })
+                        .collect(),
+                    error: None,
+                    show_all: false,
+                });
+            }
             game if game.starts_with("fun") => {
                 self.tab = Tab::Fun;
                 if let Some(fun) = &mut self.fun {
