@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::f32::consts::PI;
 
 use eframe::egui::{self, Color32, CornerRadius, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 
 use super::{PARTY, sample, song_card};
 use crate::api::Track;
@@ -606,5 +606,158 @@ impl std::hash::Hasher for Fnv {
             self.0 ^= *b as u64;
             self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
         }
+    }
+}
+
+// ---- Older or Newer ----
+
+/// Two songs with different release years: click the one that came out first.
+#[derive(Default)]
+pub struct OlderNewer {
+    pair: Option<(Track, Track)>,
+    /// Which card was clicked (0 or 1), once the answer is shown.
+    picked: Option<usize>,
+    version: u64,
+    streak: u32,
+    best: u32,
+    played: u32,
+    right: u32,
+}
+
+impl OlderNewer {
+    fn deal(&mut self, pool: &[Track]) {
+        self.picked = None;
+        let dated: Vec<&Track> = pool.iter().filter(|t| t.year > 0).collect();
+        // Up to 20 tries to find two songs from different years.
+        let mut rng = rand::rng();
+        for _ in 0..20 {
+            let two: Vec<&&Track> = dated.choose_multiple(&mut rng, 2).collect();
+            if let [a, b] = two.as_slice()
+                && a.year != b.year
+            {
+                self.pair = Some(((**a).clone(), (**b).clone()));
+                return;
+            }
+        }
+        self.pair = None;
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        pool: &[Track],
+        version: u64,
+    ) -> Option<(Vec<Track>, String)> {
+        if self.pair.is_none() || self.version != version {
+            self.version = version;
+            self.deal(pool);
+        }
+        let Some((a, b)) = self.pair.clone() else {
+            ui.add_space(20.0);
+            ui.label(
+                RichText::new("This list needs songs from at least two different years.")
+                    .color(subdued()),
+            );
+            return None;
+        };
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} right out of {}", self.right, self.played))
+                    .font(theme::bold(16.0))
+                    .color(theme::text()),
+            );
+            if self.streak >= 2 {
+                ui.label(
+                    RichText::new(format!("·  {} in a row!", self.streak)).color(theme::accent()),
+                );
+            }
+            if self.best >= 2 {
+                ui.label(RichText::new(format!("·  best: {} in a row", self.best)).color(muted()));
+            }
+        });
+        ui.label(RichText::new("Click the song that came out first.").color(subdued()));
+        ui.add_space(14.0);
+
+        let full = ui.available_rect_before_wrap();
+        let card_w = ((full.width() - 80.0) / 2.0).clamp(140.0, 300.0);
+        let card_h = 150.0;
+        ui.allocate_rect(
+            Rect::from_min_size(full.min, vec2(full.width(), card_h + 40.0)),
+            Sense::hover(),
+        );
+        let older = if a.year < b.year { 0 } else { 1 };
+        let mut clicked = None;
+        for (side, track) in [(0usize, &a), (1, &b)] {
+            let rect = Rect::from_min_size(
+                full.min + vec2(side as f32 * (card_w + 80.0), 0.0),
+                vec2(card_w, card_h),
+            );
+            let response = ui.interact(rect, ui.scope_id().with(("older", side)), Sense::click());
+            let (fill, stroke) = match self.picked {
+                Some(_) if side == older => (raised(), Color32::from_rgb(0x2e, 0xb8, 0x6b)),
+                Some(p) if p == side => (raised(), Color32::from_rgb(0xe0, 0x4f, 0x5f)),
+                None if response.hovered() => (theme::hover(), theme::accent()),
+                _ => (raised(), theme::border()),
+            };
+            song_card(ui, rect, track, fill, stroke);
+            if self.picked.is_some() {
+                ui.painter().text(
+                    pos2(rect.center().x, rect.bottom() + 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    track.year.to_string(),
+                    theme::bold(20.0),
+                    stroke,
+                );
+            }
+            if self.picked.is_none() && response.clicked() {
+                clicked = Some(side);
+            }
+        }
+        let vs = pos2(full.left() + card_w + 40.0, full.top() + card_h / 2.0);
+        ui.painter().circle_filled(vs, 24.0, theme::accent());
+        ui.painter().text(
+            vs,
+            egui::Align2::CENTER_CENTER,
+            "?",
+            theme::bold(18.0),
+            theme::on_accent(),
+        );
+        if let Some(side) = clicked {
+            self.picked = Some(side);
+            self.played += 1;
+            if side == older {
+                self.right += 1;
+                self.streak += 1;
+                self.best = self.best.max(self.streak);
+            } else {
+                self.streak = 0;
+            }
+        }
+        let mut play = None;
+        if let Some(side) = self.picked {
+            ui.add_space(6.0);
+            let text = if side == older {
+                "Right!"
+            } else {
+                "Not quite!"
+            };
+            ui.label(
+                RichText::new(text)
+                    .font(theme::bold(16.0))
+                    .color(theme::text()),
+            );
+            ui.horizontal(|ui| {
+                if widgets::button(ui, "Next pair", ButtonStyle::Accent, 14.0).clicked() {
+                    self.deal(pool);
+                }
+                if widgets::button(ui, "Play both", ButtonStyle::Ghost, 14.0).clicked() {
+                    play = Some((
+                        vec![a.clone(), b.clone()],
+                        "From Older or Newer".to_string(),
+                    ));
+                }
+            });
+        }
+        play
     }
 }

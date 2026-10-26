@@ -560,6 +560,10 @@ impl App {
         let outbox = app.outbox.clone();
         app.tray = Tray::new(move |cmd| outbox.send(Msg::Tray(cmd)));
         app.set_discord(app.config.discord_enabled);
+        if app.config.autostart {
+            // Point the entry at this version's .exe.
+            std::thread::spawn(|| crate::autostart::set(true));
+        }
         if app.config.resume_session {
             app.saved_session = Session::load();
         }
@@ -739,8 +743,12 @@ impl App {
         self.player = Some(PlayerCtl::start(
             self.rt.handle(),
             self.http.clone(),
-            self.config.volume,
-            self.config.spotify_connect,
+            crate::player::PlayerOptions {
+                volume: self.config.volume,
+                connect: self.config.spotify_connect,
+                quality: self.config.quality,
+                normalize: self.config.normalize,
+            },
             move |msg| outbox.send(Msg::Player(msg)),
         ));
     }
@@ -1132,6 +1140,107 @@ impl App {
             format!("Added {n} songs to the queue")
         };
         self.notify(text);
+    }
+
+    /// Called when drawing a screen went wrong: start that part over, so the
+    /// app keeps running.
+    fn recover_from_crash(&mut self) {
+        log::error!("Recovered from a crash on the {} tab", self.tab_name());
+        match self.tab {
+            Tab::Fun => {
+                self.end_quiz();
+                if self.fun.is_some() {
+                    self.fun = Some(Box::new(Fun::new()));
+                }
+            }
+            Tab::Stats => self.stats = None,
+            Tab::Search => {
+                self.top = None;
+                self.search = SearchView::default();
+            }
+            Tab::Library | Tab::Podcasts | Tab::Settings => {}
+        }
+        self.lyrics_open = false;
+        self.dialog = None;
+        if self.karaoke {
+            self.set_karaoke(&self.outbox.ctx.clone(), false);
+        }
+        self.tab = Tab::Library;
+        self.notify(
+            "Something went wrong and that screen was reset. Please send the log file \
+             (Settings → Open log file) so it can be fixed.",
+        );
+    }
+
+    fn tab_name(&self) -> &'static str {
+        match self.tab {
+            Tab::Library => "Library",
+            Tab::Search => "Search",
+            Tab::Podcasts => "Podcasts",
+            Tab::Fun => "Fun",
+            Tab::Stats => "Stats",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    /// Puts a song right after the one that is playing.
+    fn play_next(&mut self, track: Track) {
+        if self.now.track.is_none() || self.queue.is_empty() || self.remote {
+            self.play_list(vec![track], 0, None);
+            return;
+        }
+        let name = track.name.clone();
+        self.queue.insert(self.queue_pos + 1, track);
+        self.user_queued += 1;
+        self.notify(format!("\"{name}\" plays next"));
+    }
+
+    /// Plays a song, followed by similar songs from Spotify's radio (even when
+    /// "keep playing similar songs" is turned off).
+    fn start_radio(&mut self, track: Track) {
+        let name = track.name.clone();
+        let autoplay = self.config.autoplay_similar;
+        self.config.autoplay_similar = true;
+        self.play_list(vec![track], 0, None);
+        self.config.autoplay_similar = autoplay;
+        self.notify(format!("Song radio: songs like \"{name}\" come next"));
+    }
+
+    /// Copies the song's link on open.spotify.com, to share it.
+    fn copy_link(&mut self, track: &Track) {
+        let mut parts = track.uri.splitn(3, ':');
+        let (_, kind, id) = (parts.next(), parts.next(), parts.next());
+        if let (Some(kind), Some(id)) = (kind, id) {
+            self.outbox
+                .ctx
+                .copy_text(format!("https://open.spotify.com/{kind}/{id}"));
+            self.notify("Copied the Spotify link");
+        }
+    }
+
+    /// Takes a song out of Up next (`index` is its place in the queue).
+    fn remove_from_queue(&mut self, index: usize) {
+        if index <= self.queue_pos || index >= self.queue.len() {
+            return;
+        }
+        if index - self.queue_pos <= self.user_queued {
+            self.user_queued = self.user_queued.saturating_sub(1);
+        }
+        let removed = self.queue.remove(index);
+        if let Some(original) = &mut self.unshuffled
+            && let Some(p) = original.iter().position(|t| t.uri == removed.uri)
+        {
+            original.remove(p);
+        }
+    }
+
+    /// Empties Up next (the song that is playing keeps playing).
+    fn clear_queue(&mut self) {
+        self.queue.truncate(self.queue_pos + 1);
+        self.user_queued = 0;
+        self.unshuffled = None;
+        self.queue_id += 1;
+        self.notify("Up next is empty");
     }
 
     /// Asks Spotify's radio for songs like the current one and adds them to the
@@ -1764,6 +1873,29 @@ impl App {
         ))));
         if let Some(tray) = &self.tray {
             tray.set_color(look.0);
+        }
+    }
+
+    /// Remembers where the window is and how big, for the next start.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        if self.mini.is_some() || self.karaoke {
+            return;
+        }
+        let (outer, inner, minimized, fullscreen, maximized) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.outer_rect,
+                v.inner_rect,
+                v.minimized == Some(true),
+                v.fullscreen == Some(true),
+                v.maximized == Some(true),
+            )
+        });
+        if minimized || fullscreen || maximized {
+            return;
+        }
+        if let (Some(outer), Some(inner)) = (outer, inner) {
+            self.config.window = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
         }
     }
 
@@ -2670,7 +2802,18 @@ impl App {
                 self.tab = Tab::Fun;
                 if let Some(fun) = &mut self.fun {
                     fun.start_pool(TrackSource::LikedSongs, 99);
-                    fun.add_to_pool(tracks);
+                    // LITE_SPOTIFY_DEMO_POOL=3 tries the games with a tiny list.
+                    let size = std::env::var("LITE_SPOTIFY_DEMO_POOL")
+                        .ok()
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(tracks.len());
+                    fun.add_to_pool(
+                        tracks
+                            .into_iter()
+                            .filter(|t| t.playable)
+                            .take(size)
+                            .collect(),
+                    );
                     fun.pool_done(None);
                     fun.demo_select(game.trim_start_matches("fun").trim_start_matches(':'));
                 }

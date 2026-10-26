@@ -32,6 +32,11 @@ enum ListAction {
     Play(usize),
     Queue(usize),
     Like(usize),
+    PlayNext(usize),
+    Radio(usize),
+    GoToAlbum(usize),
+    SearchArtist(usize),
+    CopyLink(usize),
     PlayAll,
     ShuffleAll,
     AddTo(usize, String),
@@ -47,7 +52,7 @@ enum Which {
 }
 
 /// The keyboard shortcuts, as listed in Settings.
-const SHORTCUTS: [(&str, &str); 10] = [
+const SHORTCUTS: [(&str, &str); 12] = [
     ("Space", "Play / pause"),
     ("Ctrl + \u{2192} / \u{2190}", "Next / previous song"),
     ("\u{2192} / \u{2190}", "Forward / back 10 seconds"),
@@ -57,6 +62,8 @@ const SHORTCUTS: [(&str, &str); 10] = [
     ("S", "Shuffle on / off"),
     ("R", "Repeat: off, list, song"),
     ("Ctrl + F", "Search"),
+    ("Ctrl + L", "Lyrics on / off"),
+    ("Ctrl + M", "Mini player on / off"),
     ("Ctrl + 1 \u{2026} 6", "Switch tabs"),
 ];
 
@@ -64,7 +71,13 @@ impl eframe::App for App {
     /// Runs before every frame, and also while the window is minimised, so the
     /// next song still starts and the sleep timer still works.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_messages(ctx);
+        // A bug while handling a message should not close the app either.
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle_messages(ctx);
+        }));
+        if handled.is_err() {
+            self.notify("Something went wrong in the background. Details are in the log file.");
+        }
         self.track_listening();
         if self.tab != Tab::Stats {
             self.stats = None;
@@ -79,6 +92,7 @@ impl eframe::App for App {
         self.update_media_popup();
         self.update_tray();
         self.update_window_look(ctx);
+        self.remember_window(ctx);
         self.load_thumbs();
         self.update_discord();
         self.handle_close(ctx);
@@ -94,7 +108,14 @@ impl eframe::App for App {
             Screen::SignIn { .. } => self.sign_in_screen(ui),
             Screen::Main => {
                 self.keyboard_shortcuts(&ctx);
-                self.main_screen(ui);
+                // A bug in one tab should not close the whole app: the tab is
+                // reset instead (the details go to the log file).
+                let shown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.main_screen(ui);
+                }));
+                if shown.is_err() {
+                    self.recover_from_crash();
+                }
                 // Keep the seek bar moving; otherwise only redraw when something happens.
                 if self.now.playing {
                     ctx.request_repaint_after(Duration::from_millis(500));
@@ -122,6 +143,13 @@ impl App {
         }
         use egui::Modifiers as M;
         let pressed = |modifiers: M, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
+        if pressed(M::COMMAND, Key::L) {
+            self.lyrics_open = !self.lyrics_open;
+        }
+        if pressed(M::COMMAND, Key::M) {
+            let on = self.mini.is_none();
+            self.set_mini(ctx, on);
+        }
         if pressed(M::COMMAND, Key::F) {
             self.tab = Tab::Search;
             self.focus_search = true;
@@ -927,6 +955,7 @@ impl App {
         }
         let start = self.queue_pos + 1;
         let left = self.queue.len().saturating_sub(start);
+        let mut clear = false;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("UP NEXT")
@@ -935,13 +964,30 @@ impl App {
             );
             if left > 0 {
                 ui.label(RichText::new(left.to_string()).small().color(muted()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Clear").small().color(muted()))
+                                .frame(false),
+                        )
+                        .on_hover_text("Empty Up next")
+                        .clicked()
+                    {
+                        clear = true;
+                    }
+                });
             }
         });
+        if clear {
+            self.clear_queue();
+            return;
+        }
         if left == 0 {
             ui.label(RichText::new("Nothing queued.").color(muted()));
             return;
         }
         let mut jump = None;
+        let mut remove = None;
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -989,13 +1035,25 @@ impl App {
                             );
                         },
                     );
-                    if response.on_hover_text("Click to play").clicked() {
+                    let response = response.on_hover_text("Click to play, right-click for more");
+                    if response.clicked() {
                         jump = Some(index);
                     }
+                    response.context_menu(|ui| {
+                        if ui.button("Play now").clicked() {
+                            jump = Some(index);
+                        }
+                        if ui.button("Remove from Up next").clicked() {
+                            remove = Some(index);
+                        }
+                    });
                 }
             });
         if let Some(index) = jump {
             self.jump_to(index);
+        }
+        if let Some(index) = remove {
+            self.remove_from_queue(index);
         }
     }
 
@@ -1648,6 +1706,16 @@ impl App {
             Some(ListAction::Queue(i))
         } else if row.like {
             Some(ListAction::Like(i))
+        } else if row.play_next {
+            Some(ListAction::PlayNext(i))
+        } else if row.radio {
+            Some(ListAction::Radio(i))
+        } else if row.go_to_album {
+            Some(ListAction::GoToAlbum(i))
+        } else if row.search_artist {
+            Some(ListAction::SearchArtist(i))
+        } else if row.copy_link {
+            Some(ListAction::CopyLink(i))
         } else if let Some(id) = row.add_to {
             Some(ListAction::AddTo(i, id))
         } else if row.new_playlist {
@@ -1711,10 +1779,21 @@ impl App {
             .truncate(),
         );
         ui.horizontal(|ui| {
-            let counted = if shown == count {
-                format!("{count} {noun}{owner}")
+            // Total length of the songs shown, e.g. "· 7 h 12 min".
+            let total_ms: u64 = view
+                .shown
+                .iter()
+                .map(|&i| view.tracks[i].duration_ms as u64)
+                .sum();
+            let length = if total_ms > 0 {
+                format!(" · {}", stats::format_duration(total_ms))
             } else {
-                format!("{shown} of {count} {noun}{owner}")
+                String::new()
+            };
+            let counted = if shown == count {
+                format!("{count} {noun}{length}{owner}")
+            } else {
+                format!("{shown} of {count} {noun}{length}{owner}")
             };
             ui.label(RichText::new(counted).color(subdued()));
             if view.loading {
@@ -1834,6 +1913,26 @@ impl App {
             ListAction::Play(i) => self.play_list(tracks, i, source),
             ListAction::Queue(i) => self.add_to_queue(vec![tracks[i].clone()]),
             ListAction::Like(i) => self.toggle_like(tracks[i].clone()),
+            ListAction::PlayNext(i) => self.play_next(tracks[i].clone()),
+            ListAction::Radio(i) => self.start_radio(tracks[i].clone()),
+            ListAction::GoToAlbum(i) => {
+                let t = &tracks[i];
+                self.open_list(TrackSource::Album {
+                    id: t.album_id.clone(),
+                    name: t.album.clone(),
+                });
+            }
+            ListAction::SearchArtist(i) => {
+                let artist = tracks[i]
+                    .artists
+                    .split(", ")
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                self.search_input = artist;
+                self.start_search();
+            }
+            ListAction::CopyLink(i) => self.copy_link(&tracks[i]),
             ListAction::PlayAll => self.play_list(tracks, 0, source),
             ListAction::ShuffleAll => {
                 if !self.config.shuffle {
@@ -2577,11 +2676,43 @@ impl App {
                                 retry = true;
                             }
                         });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Sound quality:").color(subdued()));
+                            for (kbps, name) in [(320, "Very high"), (160, "Normal"), (96, "Data saver")] {
+                                let style = if self.config.quality == kbps {
+                                    ButtonStyle::Accent
+                                } else {
+                                    ButtonStyle::Ghost
+                                };
+                                if widgets::button(ui, name, style, 12.0)
+                                    .on_hover_text(format!("{kbps} kbit/s"))
+                                    .clicked()
+                                    && self.config.quality != kbps
+                                {
+                                    self.config.quality = kbps;
+                                    self.config.save();
+                                    restart_player = true;
+                                }
+                            }
+                        });
                         ui.label(
-                            RichText::new("Music streams at 320 kbit/s, the best quality Spotify offers. Nothing is saved to disk.")
-                                .small()
-                                .color(muted()),
+                            RichText::new(
+                                "Very high is 320 kbit/s, the best Spotify offers; Data saver uses about a \
+                                 third of the data. Nothing is saved to disk.",
+                            )
+                            .small()
+                            .color(muted()),
                         );
+                        ui.add_space(6.0);
+                        if ui
+                            .checkbox(&mut self.config.normalize, "Same loudness for all songs")
+                            .on_hover_text("Turns loud songs down and quiet ones up, like Spotify's \"Normalize volume\"")
+                            .changed()
+                        {
+                            self.config.save();
+                            restart_player = true;
+                        }
                         ui.add_space(6.0);
                         if ui
                             .checkbox(
@@ -2639,6 +2770,17 @@ impl App {
                             (None, true) => "Starting…".to_string(),
                         };
                         ui.label(RichText::new(connect_note).small().color(muted()));
+                        if crate::autostart::SUPPORTED {
+                            ui.add_space(6.0);
+                            if ui
+                                .checkbox(&mut self.config.autostart, "Start lite-spotify when Windows starts")
+                                .changed()
+                            {
+                                self.config.save();
+                                let on = self.config.autostart;
+                                std::thread::spawn(move || crate::autostart::set(on));
+                            }
+                        }
                         if self.tray.is_some() {
                             ui.add_space(6.0);
                             if ui
