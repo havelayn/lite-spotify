@@ -76,7 +76,9 @@ fn init_logging() {
     if let Ok(file) = std::fs::File::create(config::log_file()) {
         builder.target(env_logger::Target::Pipe(Box::new(file)));
     }
-    builder.init();
+    let logger = builder.build();
+    log::set_max_level(logger.filter());
+    let _ = log::set_boxed_logger(Box::new(player::KeyWatch(logger)));
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

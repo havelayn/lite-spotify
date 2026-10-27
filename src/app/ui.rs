@@ -1526,7 +1526,7 @@ impl App {
                 });
             });
         if retry {
-            self.start_player();
+            self.restart_player();
         }
     }
 
@@ -2998,7 +2998,7 @@ impl App {
             self.set_fun_enabled(fun_enabled);
         }
         if retry {
-            self.start_player();
+            self.restart_player();
         }
         if discord_changed {
             self.set_discord(self.config.discord_enabled);
