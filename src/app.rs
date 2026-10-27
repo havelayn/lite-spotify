@@ -2959,13 +2959,14 @@ impl App {
 }
 
 /// Why Spotify refused the account, and how to fix it. Personal developer
-/// apps only work for the account that made them and the accounts added to
-/// the app's User Management page.
+/// apps only work while their owner has Premium, and only for the owner and
+/// the accounts added to the app's User Management page.
 fn not_allowed_text(e: &anyhow::Error) -> String {
     format!(
         "Spotify did not let this account use this Client ID ({e}).\n\n\
-         A Spotify developer app only works for the account that created it, plus \
-         accounts its owner adds by hand. Two ways to fix it:\n\
+         A Spotify developer app only works when the account that created it has \
+         Spotify Premium, and only for that account plus accounts its owner adds by \
+         hand. Two ways to fix it:\n\
          • Easiest: create your own developer app with this Spotify account (step 1 \
          in the guide), then click \"Use a different Client ID\" and paste your own Client ID.\n\
          • Or the app's owner opens developer.spotify.com/dashboard → the app → \

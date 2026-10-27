@@ -139,7 +139,9 @@ Next time you start the app you are signed in automatically.
 
 Every person needs **their own Spotify Premium account** and should **create their own
 developer app** (step 1 above, with their own Spotify login) and paste **their own
-Client ID**. A Spotify developer app only works for the account that created it.
+Client ID**. A Spotify developer app only works for the account that created it, and
+only if that account has **Premium** (a Spotify rule since February 2026: with a free
+account the developer app is refused, even for browsing).
 Spotify does let the app's owner add a few other accounts by hand, under
 <https://developer.spotify.com/dashboard> → your app → **User Management**, but making
 your own takes three minutes and always works.
