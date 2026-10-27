@@ -207,3 +207,8 @@ ALSA headers (`sudo apt install libasound2-dev`).
 
 The app uses the [Inter](https://rsms.me/inter/) font by Rasmus Andersson, under the
 SIL Open Font License (see `assets/fonts/Inter-LICENSE.txt`).
+
+## License
+
+lite-spotify is open source under the [MIT License](LICENSE): you may use, copy,
+change and share it, as long as the license text stays with it.
