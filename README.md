@@ -6,12 +6,17 @@ Built in Rust with [egui](https://github.com/emilk/egui) for the window and
 
 What it can do:
 
+- **Glass look:** the whole app floats on a big, blurred copy of the album cover that is
+  playing, with frosted see-through panels, pill-shaped buttons and soft hover animations.
+  Prefer something plainer? Settings → Look → Dark or Light.
+- **Now Playing screen:** click the cover in the player panel (or press Ctrl+N) for a big
+  cover, the controls and the lyrics on the song's own colours. Esc closes it.
 - **Library:** Liked Songs and your playlists, in a simple song table. Type in
   **Filter this list** to find a song, and click a column title (Title, Artist, Album,
   Time) to sort by it. Play then follows the order you see.
 - **Heart button:** save the song that is playing to Liked Songs (or click the heart in
   any song row).
-- **Search:** songs, albums, playlists and podcasts. Before you search, the Search tab
+- **Search:** songs, albums, playlists and podcasts; results show up while you type. Before you search, the Search tab
   shows your recent searches and **your top songs, artists and albums** on Spotify
   (last 4 weeks, 6 months or year).
 - **Your own playlists:** make new ones, add songs (right-click a song → Add to playlist,
@@ -40,7 +45,8 @@ What it can do:
   *Importing your Spotify history* below. Kept only on your computer.
 - **Player panel** on the right: cover, seek bar, play/pause, next/previous, shuffle,
   repeat, volume, and an **Up next** list. Right-click a song in Up next to remove it, or
-  click **Clear** to empty it.
+  click **Clear** to empty it, or **Save** to turn the queue into a playlist. The mouse
+  wheel changes the volume when the pointer is on the volume bar.
 - **Right-click any song** for: Play, Play next, Add to queue, **Start song radio** (that
   song and similar ones after it), Liked Songs, Add to playlist, **Go to album**,
   **Search for the artist** and **Copy Spotify link** (to share it).
@@ -67,7 +73,7 @@ What it can do:
 - **Sleep timer:** under the volume. The music fades out and pauses after 15–90 minutes,
   or after the current song.
 - **Keyboard shortcuts:** Space play/pause, Ctrl+→/← next/previous, →/← skip 10 seconds,
-  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+L lyrics, Ctrl+M mini player, Ctrl+1…6 tabs.
+  +/− volume, M mute, L like, S shuffle, R repeat, Ctrl+F search, Ctrl+L lyrics, Ctrl+M mini player, Ctrl+N Now Playing, Ctrl+1…6 tabs.
   The full list is in Settings.
 - **Update check:** when a new version is out, a banner with a **Download** button
   appears at the top.
@@ -76,7 +82,7 @@ What it can do:
 - The window opens where you left it, at the same size.
 - If something goes wrong in one screen, lite-spotify resets that screen instead of closing
   (and writes the details to the log file).
-- **Settings:** dark or light look (the window's title bar follows), accent colour (or
+- **Settings:** Glass, Dark or Light look (the window's title bar follows), accent colour (or
   **Album**: the colour of the cover that is playing; the app icon in the taskbar and Task
   Manager follows), **album covers in song lists** (off by default), turn the Fun tab on
   or off, account and log file.

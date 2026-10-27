@@ -314,20 +314,27 @@ pub fn button_sized(
         size.x = w;
     }
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let hovered = response.hovered();
-    let radius = CornerRadius::same(6);
+    // Fades in and out instead of switching at once.
+    let t = ui.ctx().animate_bool(response.id, response.hovered());
+    let radius = theme::button_radius(rect.height());
     let text_color = match style {
         ButtonStyle::Accent => {
-            let fill = if hovered {
-                theme::accent().gamma_multiply(1.15)
-            } else {
-                theme::accent()
-            };
+            let base = theme::accent();
+            let fill = lerp_color(base, base.gamma_multiply(1.15), t);
             ui.painter().rect_filled(rect, radius, fill);
+            if theme::is_glass() {
+                // A thin highlight along the top edge, like light on glass.
+                ui.painter().rect_stroke(
+                    rect.shrink(0.5),
+                    radius,
+                    Stroke::new(1.0, Color32::from_white_alpha(70)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             on_accent()
         }
         ButtonStyle::Ghost => {
-            let fill = if hovered { hover() } else { raised() };
+            let fill = lerp_color(raised(), hover(), t);
             ui.painter().rect(
                 rect,
                 radius,
@@ -341,6 +348,18 @@ pub fn button_sized(
     let pos = rect.center() - galley.size() / 2.0;
     ui.painter().galley(pos, galley, text_color);
     response
+}
+
+/// Blends from `a` to `b` (t = 0 gives `a`, 1 gives `b`).
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
 }
 
 /// A thin bar slider. `value` is 0..1. Returns the response and the new value
@@ -434,8 +453,11 @@ pub fn nav_row_with(
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
     if selected {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), theme::selected());
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(if theme::is_glass() { 10 } else { 6 }),
+            theme::selected(),
+        );
         ui.painter().rect_filled(
             Rect::from_min_size(rect.left_top() + vec2(0.0, 7.0), vec2(3.0, 18.0)),
             CornerRadius::same(2),
@@ -681,7 +703,9 @@ pub fn table_row(
         None
     };
     if let Some(bg) = bg {
-        ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
+        let radius = if theme::is_glass() { 8 } else { 4 };
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(radius), bg);
     }
     let cols = columns(rect.width());
     let cell = |i: usize| {

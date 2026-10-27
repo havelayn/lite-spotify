@@ -17,8 +17,10 @@ pub struct Config {
     pub volume: f32,
     /// Name of the accent colour (see `theme::ACCENTS`), or "Album".
     pub accent: String,
-    /// The light look instead of the dark one.
+    /// The light look instead of the dark one (versions before 1.0; see `look`).
     pub light_theme: bool,
+    /// Glass, Dark or Light. Not set in configs from before 1.0.
+    pub look: Option<crate::theme::Look>,
     /// Show the Fun tab (roulette, claw machine and the other song pickers).
     pub fun_enabled: bool,
     /// Play what a Fun tab game picks straight away, instead of asking first.
@@ -72,6 +74,7 @@ impl Default for Config {
             volume: 0.5,
             accent: "Amber".into(),
             light_theme: false,
+            look: None,
             fun_enabled: true,
             fun_autoplay: false,
             shuffle: false,
@@ -120,6 +123,17 @@ fn config_file() -> PathBuf {
 }
 
 impl Config {
+    /// The look to use: the chosen one, or Light for those who picked it
+    /// before there was a choice of three, else Glass.
+    pub fn look(&self) -> crate::theme::Look {
+        use crate::theme::Look;
+        self.look.unwrap_or(if self.light_theme {
+            Look::Light
+        } else {
+            Look::Glass
+        })
+    }
+
     pub fn load() -> Self {
         match fs::read_to_string(config_file()) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {

@@ -1,6 +1,7 @@
 //! The app's state and what happens behind the screens: signing in, loading
 //! lists, the play queue and talking to the player. The screens are in `app/ui.rs`.
 
+mod now_view;
 mod ui;
 
 use std::collections::HashMap;
@@ -87,6 +88,8 @@ enum Msg {
         image: egui::ColorImage,
         /// The cover's main colour, for the "Album" accent.
         color: Option<egui::Color32>,
+        /// A blurred copy for the glass look's background.
+        backdrop: egui::ColorImage,
     },
     Player(PlayerMsg),
     /// Whether a song is in Liked Songs.
@@ -338,6 +341,8 @@ pub struct App {
     dialog: Option<Dialog>,
     /// Focus the big search box on the Search tab on the next frame.
     focus_search: bool,
+    /// When the search box was last typed in, for searching while typing.
+    search_typed: Option<Instant>,
 
     /// Which songs are in Liked Songs, as far as known.
     liked: HashMap<String, bool>,
@@ -356,6 +361,8 @@ pub struct App {
 
     /// The lyrics view is shown instead of the tab.
     lyrics_open: bool,
+    /// The full-window Now Playing screen is shown.
+    now_view: bool,
     /// Full-screen karaoke: only the lyrics, big.
     karaoke: bool,
     /// The lyrics of this song (`None` while loading).
@@ -382,6 +389,10 @@ pub struct App {
     quitting: bool,
     /// The main colour of the current cover, for the "Album" accent.
     cover_color: Option<egui::Color32>,
+    /// The blurred cover behind everything in the glass look, and the
+    /// colourful background used when nothing is playing.
+    backdrop: Option<TextureHandle>,
+    default_backdrop: Option<TextureHandle>,
 
     /// Another device is playing music here through Spotify Connect; the
     /// buttons control that.
@@ -463,9 +474,9 @@ impl App {
         // Screenshots of the light look in demo mode (debug builds only).
         #[cfg(debug_assertions)]
         if std::env::var("LITE_SPOTIFY_DEMO_LIGHT").is_ok() {
-            config.light_theme = true;
+            config.look = Some(theme::Look::Light);
         }
-        theme::setup(&cc.egui_ctx, &config.accent, config.light_theme);
+        theme::setup(&cc.egui_ctx, &config.accent, config.look());
 
         let mut app = Self {
             rt,
@@ -518,6 +529,7 @@ impl App {
             queue_id: 0,
             dialog: None,
             focus_search: false,
+            search_typed: None,
             liked: HashMap::new(),
             media: None,
             media_shown: None,
@@ -527,6 +539,7 @@ impl App {
             saved_session: None,
             update: None,
             lyrics_open: false,
+            now_view: false,
             karaoke: false,
             lyrics: None,
             lyrics_scrolled_to: None,
@@ -539,6 +552,8 @@ impl App {
             mini: None,
             quitting: false,
             cover_color: None,
+            backdrop: None,
+            default_backdrop: None,
             remote: false,
             remote_status: None,
             remote_pending: None,
@@ -897,7 +912,37 @@ impl App {
         self.load_tracks(source, id);
     }
 
+    /// Searches for what is in the search box and remembers it under "Recent
+    /// searches".
     fn start_search(&mut self) {
+        self.search_typed = None;
+        self.run_search(true);
+    }
+
+    /// Searches while the user types: shortly after the last key press, and
+    /// without adding it to the recent searches.
+    fn live_search(&mut self, ctx: &egui::Context) {
+        let Some(typed) = self.search_typed else {
+            return;
+        };
+        let wait = Duration::from_millis(450);
+        if typed.elapsed() < wait {
+            ctx.request_repaint_after(wait.saturating_sub(typed.elapsed()));
+            return;
+        }
+        self.search_typed = None;
+        let query = self.search_input.trim();
+        if query.chars().count() < 2 || query == self.search.query {
+            return;
+        }
+        if self.tab != Tab::Search {
+            // Typing in the top bar moves on to the Search tab's big box.
+            self.focus_search = true;
+        }
+        self.run_search(false);
+    }
+
+    fn run_search(&mut self, remember: bool) {
         let query = self.search_input.trim().to_string();
         let Some(api) = self.api.clone() else { return };
         if query.is_empty() {
@@ -912,11 +957,14 @@ impl App {
             error: None,
         };
         self.tab = Tab::Search;
-        let recent = &mut self.config.recent_searches;
-        recent.retain(|q| !q.eq_ignore_ascii_case(&query));
-        recent.insert(0, query.clone());
-        recent.truncate(8);
-        self.config.save();
+        self.lyrics_open = false;
+        if remember {
+            let recent = &mut self.config.recent_searches;
+            recent.retain(|q| !q.eq_ignore_ascii_case(&query));
+            recent.insert(0, query.clone());
+            recent.truncate(8);
+            self.config.save();
+        }
         let outbox = self.outbox.clone();
         self.rt.spawn(async move {
             let result = api.search(&query).await.map_err(|e| format!("{e:#}"));
@@ -1578,7 +1626,7 @@ impl App {
 
     /// Loads the lyrics of the current song while the lyrics view is open.
     fn update_lyrics(&mut self) {
-        if !self.lyrics_open {
+        if !self.lyrics_open && !self.now_view {
             return;
         }
         let Some(track) = &self.now.track else {
@@ -1853,11 +1901,19 @@ impl App {
     /// Keeps the window's title bar (dark or light) and the app icon in the
     /// taskbar, Task Manager and tray in the colours of the app's look.
     fn update_window_look(&mut self, ctx: &egui::Context) {
-        let look = (theme::accent_rgb(), self.config.light_theme);
+        let look = (
+            theme::accent_rgb(),
+            self.config.look() == theme::Look::Light,
+        );
         if self.window_look == Some(look) {
             return;
         }
         self.window_look = Some(look);
+        self.default_backdrop = Some(ctx.load_texture(
+            "default-backdrop",
+            theme::default_backdrop(),
+            egui::TextureOptions::LINEAR,
+        ));
         let system_theme = if look.1 {
             egui::SystemTheme::Light
         } else {
@@ -1897,6 +1953,45 @@ impl App {
         if let (Some(outer), Some(inner)) = (outer, inner) {
             self.config.window = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
         }
+    }
+
+    /// The glass look's background: the blurred cover of the song that is
+    /// playing (or soft colours), stretched over the window and dimmed so
+    /// text stays easy to read.
+    fn paint_backdrop(&self, ctx: &egui::Context) {
+        if !theme::is_glass() {
+            return;
+        }
+        let rect = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(14, 16, 24));
+        let texture = self
+            .backdrop
+            .as_ref()
+            .filter(|_| self.now.track.is_some())
+            .or(self.default_backdrop.as_ref());
+        if let Some(texture) = texture {
+            // Cover the window, keeping the picture square.
+            let side = rect.width().max(rect.height()) * 1.15;
+            let square = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side));
+            painter.image(
+                texture.id(),
+                square,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        // Darker towards the bottom, like Apple Music's now-playing screen.
+        let top = egui::Color32::from_black_alpha(110);
+        let bottom = egui::Color32::from_black_alpha(170);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(rect.left_top(), top);
+        mesh.colored_vertex(rect.right_top(), top);
+        mesh.colored_vertex(rect.right_bottom(), bottom);
+        mesh.colored_vertex(rect.left_bottom(), bottom);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
     }
 
     /// Shows the song in the tray icon's tooltip.
@@ -2307,7 +2402,13 @@ impl App {
             let size = [img.width() as usize, img.height() as usize];
             let image = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
             let color = theme::cover_color(img.as_raw());
-            outbox.send(Msg::Cover { url, image, color });
+            let backdrop = theme::backdrop(&img);
+            outbox.send(Msg::Cover {
+                url,
+                image,
+                color,
+                backdrop,
+            });
         });
     }
 
@@ -2528,11 +2629,21 @@ impl App {
                         self.on_fun_action(action);
                     }
                 }
-                Msg::Cover { url, image, color } => {
+                Msg::Cover {
+                    url,
+                    image,
+                    color,
+                    backdrop,
+                } => {
                     let wanted = self.now.track.as_ref().and_then(|t| t.image_url.as_ref());
                     if wanted == Some(&url) {
                         self.cover_color = color;
                         self.apply_album_accent(ctx);
+                        self.backdrop = Some(ctx.load_texture(
+                            "backdrop",
+                            backdrop,
+                            egui::TextureOptions::LINEAR,
+                        ));
                         let texture =
                             ctx.load_texture("cover", image, egui::TextureOptions::LINEAR);
                         self.cover = Some((url, texture));
@@ -2726,7 +2837,7 @@ impl App {
             "settings" => self.tab = Tab::Settings,
             "mini" => self.mini = Some(egui::vec2(1200.0, 760.0)),
             "stats" => self.tab = Tab::Stats,
-            "lyrics" | "karaoke" => {
+            "lyrics" | "karaoke" | "now" => {
                 let lines = [
                     "First line of the song",
                     "Here comes the second one",
@@ -2736,7 +2847,8 @@ impl App {
                     "Then a longer line that goes on for quite a while",
                     "Last line",
                 ];
-                self.lyrics_open = true;
+                self.lyrics_open = which == "lyrics";
+                self.now_view = which == "now";
                 self.karaoke = which == "karaoke";
                 self.lyrics = Some((
                     tracks[2].uri.clone(),
