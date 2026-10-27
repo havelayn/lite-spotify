@@ -52,7 +52,7 @@ enum Which {
 }
 
 /// The keyboard shortcuts, as listed in Settings.
-const SHORTCUTS: [(&str, &str); 12] = [
+const SHORTCUTS: [(&str, &str); 13] = [
     ("Space", "Play / pause"),
     ("Ctrl + \u{2192} / \u{2190}", "Next / previous song"),
     ("\u{2192} / \u{2190}", "Forward / back 10 seconds"),
@@ -63,6 +63,7 @@ const SHORTCUTS: [(&str, &str); 12] = [
     ("R", "Repeat: off, list, song"),
     ("Ctrl + F", "Search"),
     ("Ctrl + L", "Lyrics on / off"),
+    ("Ctrl + N", "Now Playing screen (Esc closes it)"),
     ("Ctrl + M", "Mini player on / off"),
     ("Ctrl + 1 \u{2026} 6", "Switch tabs"),
 ];
@@ -83,6 +84,7 @@ impl eframe::App for App {
             self.stats = None;
         }
         self.update_lyrics();
+        self.live_search(ctx);
         self.tick_sleep(ctx);
         if self.tab != Tab::Fun || self.lyrics_open {
             // Leaving the Fun tab ends Guess the Song.
@@ -103,6 +105,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.paint_backdrop(&ctx);
         match self.screen {
             Screen::Setup { .. } => self.setup_screen(ui),
             Screen::SignIn { .. } => self.sign_in_screen(ui),
@@ -143,6 +146,9 @@ impl App {
         }
         use egui::Modifiers as M;
         let pressed = |modifiers: M, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
+        if pressed(M::COMMAND, Key::N) && self.now.track.is_some() {
+            self.now_view = !self.now_view;
+        }
         if pressed(M::COMMAND, Key::L) {
             self.lyrics_open = !self.lyrics_open;
         }
@@ -237,7 +243,7 @@ impl App {
                         Frame::new()
                             .fill(surface())
                             .stroke(Stroke::new(1.0, border()))
-                            .corner_radius(14)
+                            .corner_radius(if theme::is_glass() { 22 } else { 14 })
                             .inner_margin(32)
                             .show(ui, |ui| {
                                 ui.set_width(width - 64.0);
@@ -472,6 +478,10 @@ impl App {
             self.mini_player(ui);
             return;
         }
+        if self.now_view && !self.karaoke {
+            self.now_view_screen(ui);
+            return;
+        }
         if self.karaoke {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.set_karaoke(&ui.ctx().clone(), false);
@@ -480,20 +490,18 @@ impl App {
             self.toast(ui.ctx());
             return;
         }
+        let glass = theme::is_glass();
         egui::Panel::top("top")
-            .exact_size(54.0)
+            .exact_size(if glass { 66.0 } else { 54.0 })
             .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(surface())
-                    .inner_margin(Margin::symmetric(14, 0)),
-            )
+            .frame(theme::panel_frame(Margin::symmetric(14, 0)))
             .show(ui, |ui| self.top_bar(ui));
         egui::Panel::right("now-playing")
             .resizable(true)
-            .default_size(300.0)
-            .size_range(230.0..=420.0)
-            .frame(Frame::new().fill(surface()).inner_margin(Margin::same(16)))
+            .default_size(if glass { 312.0 } else { 300.0 })
+            .size_range(230.0..=440.0)
+            .show_separator_line(!glass)
+            .frame(theme::panel_frame(Margin::same(16)))
             .show(ui, |ui| self.now_playing_panel(ui));
         egui::CentralPanel::default()
             .frame(Frame::new().fill(bg()))
@@ -519,11 +527,13 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         let bar = ui.max_rect();
-        ui.painter().hline(
-            bar.x_range(),
-            bar.bottom() - 0.5,
-            Stroke::new(1.0, border()),
-        );
+        if !theme::is_glass() {
+            ui.painter().hline(
+                bar.x_range(),
+                bar.bottom() - 0.5,
+                Stroke::new(1.0, border()),
+            );
+        }
         ui.horizontal_centered(|ui| {
             widgets::logo(ui, 26.0);
             ui.label(
@@ -614,6 +624,9 @@ impl App {
                     .hint_text("Search songs, albums, podcasts")
                     .desired_width(f32::INFINITY),
             );
+            if edit.changed() {
+                self.search_typed = Some(std::time::Instant::now());
+            }
             edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
         });
         if !self.search_input.is_empty() {
@@ -645,6 +658,14 @@ impl App {
             .min((ui.available_height() - 365.0).max(110.0));
         let (cover_rect, _) = ui.allocate_exact_size(vec2(width, size), Sense::hover());
         let cover_rect = Rect::from_center_size(cover_rect.center(), Vec2::splat(size));
+        // Clicking the cover opens the big Now Playing screen.
+        let cover_click = ui
+            .interact(cover_rect, ui.scope_id().with("cover"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Open Now Playing (Ctrl + N)");
+        if cover_click.clicked() && has_track {
+            self.now_view = true;
+        }
         let icon = if self.now.track.as_ref().is_some_and(|t| t.is_episode) {
             Icon::Mic
         } else {
@@ -854,6 +875,10 @@ impl App {
             if let Some(v) = new_volume {
                 self.set_volume(v);
             }
+            // The mouse wheel works on the volume bar too.
+            if let Some(v) = super::now_view::wheel_volume(ui, &response, self.config.volume) {
+                self.set_volume(v);
+            }
             if response.drag_stopped() || response.clicked() {
                 self.config.save();
             }
@@ -956,6 +981,7 @@ impl App {
         let start = self.queue_pos + 1;
         let left = self.queue.len().saturating_sub(start);
         let mut clear = false;
+        let mut save = false;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("UP NEXT")
@@ -975,12 +1001,35 @@ impl App {
                     {
                         clear = true;
                     }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Save").small().color(muted()))
+                                .frame(false),
+                        )
+                        .on_hover_text(
+                            "Save the song that is playing and Up next as a new playlist",
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
                 });
             }
         });
         if clear {
             self.clear_queue();
             return;
+        }
+        if save && self.check_can_edit() {
+            let tracks: Vec<Track> = self.queue[self.queue_pos.min(self.queue.len())..]
+                .iter()
+                .filter(|t| t.playable)
+                .cloned()
+                .collect();
+            self.dialog = Some(Dialog::NewPlaylist {
+                name: "My queue".to_string(),
+                tracks,
+            });
         }
         if left == 0 {
             ui.label(RichText::new("Nothing queued.").color(muted()));
@@ -1132,7 +1181,7 @@ impl App {
         }
     }
 
-    fn lyrics_lines(&mut self, ui: &mut Ui, karaoke: bool) {
+    pub(super) fn lyrics_lines(&mut self, ui: &mut Ui, karaoke: bool) {
         let center = |ui: &mut Ui, text: RichText| {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| ui.label(text));
@@ -1489,15 +1538,13 @@ impl App {
             .default_size(230.0)
             .size_range(170.0..=380.0)
             .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(surface())
-                    .inner_margin(Margin::symmetric(10, 12)),
-            )
+            .frame(theme::panel_frame(Margin::symmetric(10, 12)))
             .show(ui, |ui| {
-                let rect = ui.max_rect().expand2(vec2(10.0, 12.0));
-                ui.painter()
-                    .vline(rect.right(), rect.y_range(), Stroke::new(1.0, border()));
+                if !theme::is_glass() {
+                    let rect = ui.max_rect().expand2(vec2(10.0, 12.0));
+                    ui.painter()
+                        .vline(rect.right(), rect.y_range(), Stroke::new(1.0, border()));
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
@@ -2339,6 +2386,13 @@ impl App {
         let id = egui::Id::unique("big-search");
         if std::mem::take(&mut self.focus_search) {
             ui.memory_mut(|m| m.request_focus(id));
+            // Put the text cursor at the end, to carry on typing.
+            let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+            let end = egui::text::CCursor::new(self.search_input.chars().count());
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(ui.ctx(), id);
         }
         let focused = ui.memory(|m| m.has_focus(id));
         let stroke = if focused {
@@ -2374,6 +2428,9 @@ impl App {
                     .hint_text("Songs, artists, albums, playlists, podcasts…")
                     .desired_width(f32::INFINITY),
             );
+            if edit.changed() {
+                self.search_typed = Some(std::time::Instant::now());
+            }
             edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
         });
         let button = Rect::from_min_max(
@@ -2547,15 +2604,15 @@ impl App {
 
                     settings_card(ui, "Look", |ui| {
                         ui.horizontal(|ui| {
-                            for (light, name) in [(false, "Dark"), (true, "Light")] {
-                                let style = if self.config.light_theme == light {
+                            for look in theme::Look::ALL {
+                                let style = if self.config.look() == look {
                                     ButtonStyle::Accent
                                 } else {
                                     ButtonStyle::Ghost
                                 };
-                                if widgets::button(ui, name, style, 13.0).clicked() {
-                                    self.config.light_theme = light;
-                                    theme::set_light(&ctx, light);
+                                if widgets::button(ui, look.name(), style, 13.0).clicked() {
+                                    self.config.look = Some(look);
+                                    theme::set_look(&ctx, look);
                                     self.config.save();
                                 }
                             }
@@ -2994,7 +3051,7 @@ impl App {
         let modal = egui::Modal::new(egui::Id::unique("dialog"))
             .frame(
                 Frame::new()
-                    .fill(surface())
+                    .fill(theme::overlay())
                     .stroke(Stroke::new(1.0, border()))
                     .corner_radius(12)
                     .inner_margin(Margin::same(22)),
@@ -3075,7 +3132,7 @@ impl App {
     }
 
     /// Short messages at the bottom of the window.
-    fn toast(&mut self, ctx: &egui::Context) {
+    pub(super) fn toast(&mut self, ctx: &egui::Context) {
         let Some((text, since)) = &self.notice else {
             return;
         };
@@ -3091,7 +3148,7 @@ impl App {
             .interactable(true)
             .show(ctx, |ui| {
                 let response = Frame::new()
-                    .fill(raised())
+                    .fill(theme::overlay())
                     .stroke(Stroke::new(1.0, theme::accent()))
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(16, 10))
@@ -3116,6 +3173,24 @@ fn tab_button(ui: &mut Ui, label: &str, selected: bool, bar_bottom: f32) -> egui
     } else {
         subdued()
     };
+    if theme::is_glass() {
+        // A frosted pill behind the selected tab, fading in on hover.
+        let hover = ui.ctx().animate_bool(response.id, response.hovered());
+        let pill = Rect::from_center_size(rect.center(), vec2(rect.width(), 32.0));
+        let alpha = if selected { 1.0 } else { hover * 0.5 };
+        if alpha > 0.0 {
+            ui.painter().rect(
+                pill,
+                CornerRadius::same(16),
+                theme::selected().gamma_multiply(alpha),
+                Stroke::new(1.0, theme::border().gamma_multiply(alpha)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, color);
+        return response;
+    }
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
     if selected {
@@ -3396,7 +3471,7 @@ fn stat_tile(ui: &mut Ui, number: &str, label: &str) {
     Frame::new()
         .fill(surface())
         .stroke(Stroke::new(1.0, border()))
-        .corner_radius(10)
+        .corner_radius(if theme::is_glass() { 18 } else { 10 })
         .inner_margin(Margin::symmetric(18, 12))
         .show(ui, |ui| {
             ui.vertical(|ui| {
@@ -3561,7 +3636,7 @@ fn settings_card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     Frame::new()
         .fill(surface())
         .stroke(Stroke::new(1.0, border()))
-        .corner_radius(10)
+        .corner_radius(if theme::is_glass() { 18 } else { 10 })
         .inner_margin(Margin::same(16))
         .outer_margin(Margin {
             left: 0,

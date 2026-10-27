@@ -1,14 +1,15 @@
-//! Colours, fonts and the egui style: a dark "midnight" look with a choice of
-//! accent colours.
+//! Colours, fonts and the egui style. Three looks: Glass (frosted, see-through
+//! panels floating on a blurred copy of the album cover), Dark and Light, each
+//! with a choice of accent colours.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Vec2,
 };
 
-/// The colours of the dark or the light look.
+/// The colours of one look.
 struct Palette {
     bg: Color32,
     surface: Color32,
@@ -48,18 +49,104 @@ const LIGHT: Palette = Palette {
     error: Color32::from_rgb(0xc8, 0x2a, 0x40),
 };
 
-static LIGHT_MODE: AtomicBool = AtomicBool::new(false);
+/// White at `a`/255 opacity, premultiplied (what egui expects).
+const fn white(a: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(a, a, a, a)
+}
+
+/// Frosted glass: panels are see-through white over the blurred cover.
+const GLASS: Palette = Palette {
+    bg: Color32::TRANSPARENT,
+    surface: white(20),
+    raised: white(28),
+    hover: white(44),
+    selected: white(60),
+    border: white(40),
+    text: Color32::from_rgb(0xf7, 0xf8, 0xfb),
+    subdued: Color32::from_rgb(0xc9, 0xcc, 0xd6),
+    muted: Color32::from_rgb(0x93, 0x98, 0xa8),
+    error: Color32::from_rgb(0xff, 0x84, 0x92),
+};
+
+/// Which look the app has.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, Default)]
+pub enum Look {
+    #[default]
+    Glass,
+    Dark,
+    Light,
+}
+
+impl Look {
+    pub const ALL: [Look; 3] = [Look::Glass, Look::Dark, Look::Light];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Look::Glass => "Glass",
+            Look::Dark => "Dark",
+            Look::Light => "Light",
+        }
+    }
+}
+
+static LOOK: AtomicU8 = AtomicU8::new(0);
+
+pub fn look() -> Look {
+    match LOOK.load(Ordering::Relaxed) {
+        1 => Look::Dark,
+        2 => Look::Light,
+        _ => Look::Glass,
+    }
+}
 
 fn palette() -> &'static Palette {
-    if LIGHT_MODE.load(Ordering::Relaxed) {
-        &LIGHT
-    } else {
-        &DARK
+    match look() {
+        Look::Glass => &GLASS,
+        Look::Dark => &DARK,
+        Look::Light => &LIGHT,
     }
 }
 
 pub fn is_light() -> bool {
-    LIGHT_MODE.load(Ordering::Relaxed)
+    look() == Look::Light
+}
+
+pub fn is_glass() -> bool {
+    look() == Look::Glass
+}
+
+/// How round buttons are: pill-shaped in the glass look.
+pub fn button_radius(height: f32) -> CornerRadius {
+    if is_glass() {
+        CornerRadius::same((height / 2.0).min(255.0) as u8)
+    } else {
+        CornerRadius::same(6)
+    }
+}
+
+/// The fill of things that float over everything (messages, dialogs). Nearly
+/// solid in the glass look, so the text under them doesn't shine through.
+pub fn overlay() -> Color32 {
+    if is_glass() {
+        Color32::from_rgba_unmultiplied(24, 26, 36, 240)
+    } else {
+        surface()
+    }
+}
+
+/// The frame of a big panel (top bar, side lists, the player panel). In the
+/// glass look it is a frosted card floating a little away from the edges.
+pub fn panel_frame(inner: egui::Margin) -> egui::Frame {
+    if is_glass() {
+        egui::Frame::new()
+            .fill(surface())
+            .stroke(Stroke::new(1.0, border()))
+            .corner_radius(18)
+            .inner_margin(inner)
+            .outer_margin(egui::Margin::same(6))
+    } else {
+        egui::Frame::new().fill(surface()).inner_margin(inner)
+    }
 }
 
 /// Behind everything.
@@ -157,10 +244,44 @@ pub fn set_accent_color(ctx: &egui::Context, color: Color32) {
     apply_visuals(ctx);
 }
 
-/// Switches between the dark and the light look.
-pub fn set_light(ctx: &egui::Context, light: bool) {
-    LIGHT_MODE.store(light, Ordering::Relaxed);
+/// Switches the look.
+pub fn set_look(ctx: &egui::Context, look: Look) {
+    LOOK.store(look as u8, Ordering::Relaxed);
     apply_visuals(ctx);
+}
+
+/// A soft, blurred copy of a cover for the glass look's background: small
+/// (48 × 48 pixels), since it is stretched over the window anyway.
+pub fn backdrop(img: &image::RgbaImage) -> egui::ColorImage {
+    let small = image::imageops::resize(img, 48, 48, image::imageops::FilterType::Triangle);
+    let blurred = image::imageops::blur(&small, 3.5);
+    egui::ColorImage::from_rgba_unmultiplied([48, 48], blurred.as_raw())
+}
+
+/// The glass background when nothing is playing: soft blobs of colour.
+pub fn default_backdrop() -> egui::ColorImage {
+    let [ar, ag, ab] = accent_rgb();
+    let blobs = [
+        (0.2f32, 0.25f32, [ar, ag, ab]),
+        (0.85, 0.3, [0x5b, 0x46, 0xd8]),
+        (0.55, 0.9, [0x1f, 0x8a, 0xb8]),
+    ];
+    let mut pixels = Vec::with_capacity(48 * 48 * 4);
+    for y in 0..48 {
+        for x in 0..48 {
+            let (fx, fy) = (x as f32 / 47.0, y as f32 / 47.0);
+            let mut c = [18.0f32, 20.0, 34.0];
+            for (bx, by, col) in blobs {
+                let d = ((fx - bx).powi(2) + (fy - by).powi(2)).sqrt();
+                let w = (1.0 - d / 0.55).clamp(0.0, 1.0).powi(2) * 0.85;
+                for i in 0..3 {
+                    c[i] = c[i] * (1.0 - w) + col[i] as f32 * w;
+                }
+            }
+            pixels.extend([c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([48, 48], &pixels)
 }
 
 /// A bright, colourful colour that stands for a cover: the most common
@@ -246,11 +367,11 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn setup(ctx: &egui::Context, accent_name: &str, light: bool) {
+pub fn setup(ctx: &egui::Context, accent_name: &str, look: Look) {
     setup_fonts(ctx);
-    // egui's own theme setting stays on "dark"; `set_light` swaps the colours.
+    // egui's own theme setting stays on "dark"; `set_look` swaps the colours.
     ctx.set_theme(egui::Theme::Dark);
-    LIGHT_MODE.store(light, Ordering::Relaxed);
+    LOOK.store(look as u8, Ordering::Relaxed);
     set_accent(ctx, accent_name);
 
     ctx.style_mut_of(egui::Theme::Dark, |style| {
@@ -282,6 +403,15 @@ fn apply_visuals(ctx: &egui::Context) {
     v.window_stroke = Stroke::new(1.0, border());
     v.window_corner_radius = CornerRadius::same(8);
     v.menu_corner_radius = CornerRadius::same(8);
+    if is_glass() {
+        // Menus, tooltips and dialogs: dark frosted cards (nearly solid, as
+        // nothing behind them is blurred).
+        v.window_fill = Color32::from_rgba_unmultiplied(24, 26, 36, 240);
+        v.window_stroke = Stroke::new(1.0, white(50));
+        v.window_corner_radius = CornerRadius::same(14);
+        v.menu_corner_radius = CornerRadius::same(12);
+        v.extreme_bg_color = white(26);
+    }
     v.extreme_bg_color = raised();
     v.faint_bg_color = raised();
     v.code_bg_color = raised();

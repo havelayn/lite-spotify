@@ -268,6 +268,16 @@ impl Fun {
         let full = ui.max_rect();
         let menu_w = 210.0;
         let menu = Rect::from_min_size(full.min, vec2(menu_w, full.height()));
+        if theme::is_glass() {
+            // The list of games on a frosted card.
+            ui.painter().rect(
+                menu.shrink(6.0),
+                CornerRadius::same(18),
+                theme::surface(),
+                egui::Stroke::new(1.0, theme::border()),
+                egui::StrokeKind::Inside,
+            );
+        }
         widgets::place(
             ui,
             egui::UiBuilder::new().max_rect(menu.shrink(12.0)),
@@ -292,11 +302,13 @@ impl Fun {
                 }
             },
         );
-        ui.painter().vline(
-            menu.right(),
-            menu.y_range(),
-            egui::Stroke::new(1.0, theme::border()),
-        );
+        if !theme::is_glass() {
+            ui.painter().vline(
+                menu.right(),
+                menu.y_range(),
+                egui::Stroke::new(1.0, theme::border()),
+            );
+        }
 
         // Right: the game.
         let area = Rect::from_min_max(
