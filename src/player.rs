@@ -3,6 +3,7 @@
 //! Audio is streamed and played straight away. librespot's audio cache is
 //! turned off; the only thing stored on disk is librespot's reusable login.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -28,6 +29,44 @@ use tokio::sync::mpsc;
 use crate::api::{Track, join_names};
 use crate::auth;
 use crate::config;
+
+/// How often Spotify refused to unlock a song since the last song that played.
+static KEY_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+/// Passes log messages on to the log file, and notices when Spotify refuses
+/// to hand out the key of a song (librespot only reports that in its log).
+/// Spotify does that for some accounts and then no song can play.
+pub struct KeyWatch(pub env_logger::Logger);
+
+impl log::Log for KeyWatch {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if record.level() == log::Level::Error
+            && record.target() == "librespot_core::audio_key"
+            && record.args().to_string().starts_with("error audio key")
+        {
+            KEY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.0.log(record);
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Whether Spotify keeps refusing to unlock songs for this account.
+pub fn keys_refused() -> bool {
+    KEY_REFUSALS.load(Ordering::Relaxed) >= 2
+}
+
+/// Starts counting again (a song played, or the player restarts).
+pub fn reset_key_refusals() {
+    KEY_REFUSALS.store(0, Ordering::Relaxed);
+}
 
 /// What the player tells the UI.
 #[derive(Debug)]
@@ -747,4 +786,34 @@ async fn connect(http: &reqwest::Client, notify: &Notify) -> Result<Session> {
             )
         })?;
     Ok(session)
+}
+
+#[cfg(test)]
+mod tests {
+    use log::Log;
+
+    use super::*;
+
+    #[test]
+    fn notices_refused_keys() {
+        let watch = KeyWatch(env_logger::Builder::new().build());
+        let refusal = |target: &str| {
+            watch.log(
+                &log::Record::builder()
+                    .level(log::Level::Error)
+                    .target(target)
+                    .args(format_args!("error audio key 0 1"))
+                    .build(),
+            );
+        };
+        reset_key_refusals();
+        refusal("librespot_core::audio_key");
+        assert!(!keys_refused());
+        refusal("something_else");
+        assert!(!keys_refused());
+        refusal("librespot_core::audio_key");
+        assert!(keys_refused());
+        reset_key_refusals();
+        assert!(!keys_refused());
+    }
 }

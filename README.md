@@ -1,5 +1,20 @@
 # lite-spotify
 
+> [!WARNING]
+> **Read this before you download.** lite-spotify is an unofficial player, and Spotify
+> decides for each account whether it may play music in it.
+>
+> - You need **Spotify Premium**. Free accounts can't play anything.
+> - **Some Premium accounts can't play music in lite-spotify at all.** Spotify refuses
+>   to unlock the songs for them (mostly newer accounts). Signing in, browsing and
+>   playlists work, but songs won't play. There is no fix for this in the app; it is
+>   Spotify's choice ([details](https://github.com/librespot-org/librespot/issues/1649)).
+>   If it happens, lite-spotify tells you so.
+> - Spotify can change this at any time, also for accounts that work today.
+> - Each person needs to make their own free Spotify developer app (step 1 below).
+>
+> lite-spotify only streams. It never downloads or saves music.
+
 A small, low-memory Spotify player for Windows. It uses your own **Spotify Premium** account.
 Built in Rust with [egui](https://github.com/emilk/egui) for the window and
 [librespot](https://github.com/librespot-org/librespot) for audio.

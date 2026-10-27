@@ -1,6 +1,6 @@
 [package]
 name = "lite-spotify"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "Lightweight Spotify Premium player for Windows (egui + librespot)"
 license = "MIT"

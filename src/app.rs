@@ -765,6 +765,7 @@ impl App {
     }
 
     fn start_player(&mut self) {
+        crate::player::reset_key_refusals();
         let outbox = self.outbox.clone();
         self.player_state = PlayerState::Connecting;
         self.remote = false;
@@ -2471,6 +2472,7 @@ impl App {
             }
             PlayerMsg::Loading { uri } if is_current(&uri) => self.now.loading = true,
             PlayerMsg::Playing { uri, position_ms } if is_current(&uri) => {
+                crate::player::reset_key_refusals();
                 self.skipped_in_a_row = 0;
                 self.now.playing = true;
                 self.now.loading = false;
@@ -2508,7 +2510,12 @@ impl App {
             }
             PlayerMsg::Unavailable { uri } if is_current(&uri) => {
                 self.skipped_in_a_row += 1;
-                if self.skipped_in_a_row > 5 {
+                if crate::player::keys_refused() {
+                    // Skipping on would fail for every song.
+                    self.now.loading = false;
+                    self.now.playing = false;
+                    self.player_state = PlayerState::Failed(KEYS_REFUSED.into());
+                } else if self.skipped_in_a_row > 5 {
                     self.notify("Several songs in a row could not be played. Playback stopped.");
                     self.now.loading = false;
                 } else {
@@ -2957,6 +2964,12 @@ impl App {
         self.notify("\"Song title 4\" is not available, skipped it.");
     }
 }
+
+/// Shown when Spotify won't unlock songs for this account.
+const KEYS_REFUSED: &str = "Spotify won't let this account play music in third-party players \
+     right now (it refuses to unlock the songs). This happens to some accounts, mostly newer \
+     ones, and nothing in lite-spotify can change it. Browsing, playlists and stats still work. \
+     Click Retry to try again later.";
 
 /// Why Spotify refused the account, and how to fix it. Personal developer
 /// apps only work while their owner has Premium, and only for the owner and
