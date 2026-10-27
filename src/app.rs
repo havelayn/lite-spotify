@@ -36,6 +36,8 @@ enum Msg {
     SignInUrl(String),
     SignedIn(Arc<WebApi>, Option<String>),
     SignInFailed(String),
+    /// Spotify refused this account for this Client ID: sign out and say why.
+    AccountNotAllowed(String),
     NewRefreshToken(String),
     /// Who is signed in, whether the login may change playlists and Liked
     /// Songs, and whether it may read top and recently played songs.
@@ -711,7 +713,19 @@ impl App {
 
         let outbox = self.outbox.clone();
         self.rt.spawn(async move {
-            if let Ok(me) = api.me().await {
+            let me = match api.me().await {
+                Ok(me) => Some(me),
+                Err(e) if api::is_status(&e, reqwest::StatusCode::FORBIDDEN) => {
+                    log::warn!("Spotify refused this account: {e:#}");
+                    outbox.send(Msg::AccountNotAllowed(not_allowed_text(&e)));
+                    None
+                }
+                Err(e) => {
+                    log::warn!("Could not read the account: {e:#}");
+                    None
+                }
+            };
+            if let Some(me) = me {
                 let can_edit = api.can_edit().await;
                 let can_history = api.can_read_history().await;
                 outbox.send(Msg::Me(me, can_edit, can_history));
@@ -2521,6 +2535,14 @@ impl App {
                     }
                 }
                 Msg::SignedIn(api, rt) => self.on_signed_in(api, rt),
+                Msg::AccountNotAllowed(e) => {
+                    self.sign_out();
+                    self.screen = Screen::SignIn {
+                        url: None,
+                        busy: false,
+                        error: Some(e),
+                    };
+                }
                 Msg::SignInFailed(e) => {
                     self.screen = Screen::SignIn {
                         url: None,
@@ -2934,6 +2956,21 @@ impl App {
         }
         self.notify("\"Song title 4\" is not available, skipped it.");
     }
+}
+
+/// Why Spotify refused the account, and how to fix it. Personal developer
+/// apps only work for the account that made them and the accounts added to
+/// the app's User Management page.
+fn not_allowed_text(e: &anyhow::Error) -> String {
+    format!(
+        "Spotify did not let this account use this Client ID ({e}).\n\n\
+         A Spotify developer app only works for the account that created it, plus \
+         accounts its owner adds by hand. Two ways to fix it:\n\
+         • Easiest: create your own developer app with this Spotify account (step 1 \
+         in the guide), then click \"Use a different Client ID\" and paste your own Client ID.\n\
+         • Or the app's owner opens developer.spotify.com/dashboard → the app → \
+         User Management, and adds your name and the email of your Spotify account."
+    )
 }
 
 /// A readable message for a failed playlist change.

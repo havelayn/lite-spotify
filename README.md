@@ -135,6 +135,21 @@ a green check mark and download **lite-spotify-windows** under **Artifacts**
 
 Next time you start the app you are signed in automatically.
 
+## Using it on a friend's computer
+
+Every person needs **their own Spotify Premium account** and should **create their own
+developer app** (step 1 above, with their own Spotify login) and paste **their own
+Client ID**. A Spotify developer app only works for the account that created it.
+Spotify does let the app's owner add a few other accounts by hand, under
+<https://developer.spotify.com/dashboard> → your app → **User Management**, but making
+your own takes three minutes and always works.
+
+If lite-spotify says *"Spotify did not let this account use this Client ID"*, this is
+why: click **Use a different Client ID** and paste a Client ID made with that account.
+
+Also make sure the browser logs in to the right Spotify account. If someone else is
+already logged in to Spotify in that browser, log them out on spotify.com first.
+
 ## Good to know
 
 - **Where are my settings?** In `%APPDATA%\lite-spotify` (paste that into the Explorer
